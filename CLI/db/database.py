@@ -47,8 +47,6 @@ logger = logging.getLogger(__name__)
 
 DB_PATH: str = str(Path(__file__).resolve().parent.parent.parent / "vitals_pipeline.db")
 
-# ── JSON helpers ──────────────────────────────────────────────────────────────
-
 def _j(arr) -> str:
     """Serialize a numpy array or Python list to a compact JSON string."""
     if arr is None:
@@ -65,7 +63,7 @@ def _uj(s: Optional[str]) -> np.ndarray:
     return np.array(json.loads(s))
 
 
-# ── Connection factory ────────────────────────────────────────────────────────
+# Connection factory 
 
 def _conn() -> sqlite3.Connection:
     """Return a WAL-mode connection with Row factory."""
@@ -76,7 +74,7 @@ def _conn() -> sqlite3.Connection:
     return con
 
 
-# ── Schema DDL ────────────────────────────────────────────────────────────────
+# Schema DDL 
 
 _DDL = """
 -- ═══════════════════════════════════════
@@ -363,10 +361,6 @@ def log_module(
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ARRHYTHMIA HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def insert_arr_raw(rows: List[tuple]) -> None:
     """Bulk-insert raw arrhythmia beats.
 
@@ -483,10 +477,6 @@ def fetch_arr_predictions(limit: int = 200) -> List[Dict]:
         ).fetchall()
     return [dict(r) for r in rows]
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# APNEA HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def insert_apnea_raw(
     record: str,
@@ -650,10 +640,6 @@ def fetch_apnea_ecg_plot(
             ).fetchone()
     return dict(row) if row else None
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SEPSIS HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def insert_sep_raw(rows: List[tuple]) -> None:
     """Bulk-insert raw sepsis rows.

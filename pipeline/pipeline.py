@@ -110,7 +110,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── config ────────────────────────────────────────────────────────────────────
-DATA_DIR: str = os.environ.get("DATA_DIR", "/Users/sathvik/Desktop/Internship/archive2")
+DATA_DIR: str = os.environ.get("DATA_DIR", "../archive2/")
 MIMIC_URL: str = "https://physionet.org/files/mimic4wdb/0.1.0/"
 FS_MIMIC: int = 320
 SEGMENT_LEN_S: int = 30
