@@ -45,8 +45,6 @@ app.add_middleware(
 )
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-
 def _db() -> sqlite3.Connection:
     """Open a read-only Row-factory connection, raise 503 if DB missing."""
     if not os.path.exists(DB_PATH):
@@ -83,9 +81,6 @@ def _parse_report(rows: List[Dict]) -> List[Dict]:
             del r["report_json"]
     return rows
 
-
-# ── Global exception handler ──────────────────────────────────────────────────
-
 @app.exception_handler(Exception)
 async def _global_handler(request, exc):
     """Return a generic 500 — never expose stack traces to clients."""
@@ -97,9 +92,8 @@ async def _global_handler(request, exc):
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # SHARED ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 @app.get("/summary", tags=["Shared"])
 def summary() -> Dict[str, Any]:
@@ -130,9 +124,8 @@ def pipeline_log_latest() -> Dict:
     return _one("SELECT * FROM pipeline_log ORDER BY ts DESC LIMIT 1") or {}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # ARRHYTHMIA ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 @app.get("/arrhythmia/summary", tags=["Arrhythmia"])
 def arrhythmia_summary() -> Dict[str, Any]:
@@ -239,9 +232,8 @@ def arrhythmia_confusion_matrix() -> List[Dict]:
     """)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # APNEA ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 @app.get("/apnea/summary", tags=["Apnea"])
 def apnea_summary() -> Dict[str, Any]:
@@ -443,9 +435,8 @@ def apnea_feature_importance() -> List[Dict]:
     return sorted(result, key=lambda x: x["importance"], reverse=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # SEPSIS ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 @app.get("/sepsis/summary", tags=["Sepsis"])
 def sepsis_summary() -> Dict[str, Any]:

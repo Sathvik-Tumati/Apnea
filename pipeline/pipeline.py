@@ -43,7 +43,6 @@ from scipy.signal import butter, coherence, filtfilt, find_peaks
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
-# ── path bootstrap ────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from CLI.db.database import (
@@ -74,7 +73,6 @@ from CLI.db.database import (
     log_module,
 )
 
-# ── optional heavy deps ───────────────────────────────────────────────────────
 try:
     import neurokit2 as nk
     HAS_NK = True
@@ -98,7 +96,7 @@ from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-# ── logging ───────────────────────────────────────────────────────────────────
+#logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -109,7 +107,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── config ────────────────────────────────────────────────────────────────────
+#config
 DATA_DIR: str = os.environ.get("DATA_DIR", "../archive2/")
 MIMIC_URL: str = "https://physionet.org/files/mimic4wdb/0.1.0/"
 FS_MIMIC: int = 320
@@ -168,18 +166,18 @@ APNEA_FEATURE_COLS: List[str] = [
 ]
 
 
-# ── shared signal utilities ───────────────────────────────────────────────────
+#shared signal utilities 
 
 def _bandpass(signal: np.ndarray, fs: int,
               lo: float = 0.5, hi: float = 40.0,
               order: int = 3) -> np.ndarray:
     """Apply a zero-phase Butterworth bandpass filter."""
     nyq = fs / 2.0
-    # Ensure hi is strictly less than nyquist frequency to prevent ValueError
+
     actual_hi = min(hi, nyq - 0.1)
-    # Ensure lo is valid relative to actual_hi
+
     actual_lo = min(lo, actual_hi - 0.1)
-    
+
     b, a = butter(order, [actual_lo / nyq, actual_hi / nyq], btype="band")
     return filtfilt(b, a, signal)
 
@@ -206,9 +204,8 @@ def _resolve(underscore: str, spaced: str) -> Optional[str]:
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # MODULE 1 — ARRHYTHMIA
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _arr_preprocess_row(raw: Dict) -> Dict[str, float]:
     """Derive cleaned features from one raw ECG beat dict."""
@@ -241,7 +238,7 @@ def _arr_save_ecg_plot(df: pd.DataFrame, le: LabelEncoder) -> None:
             continue
         row = sub.iloc[0]
         record = str(row.get("record", "unknown"))
-        # Reconstruct a synthetic beat from morph columns
+        # Reconstructing a synthetic beat from morph columns
         morph_cols = [c for c in df.columns if "morph" in c and c.startswith("0_")]
         ecg_segment = np.array(
             [float(row.get(c) or 0.0) for c in morph_cols], dtype=float
@@ -267,7 +264,7 @@ def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
     logger.info(" ARRHYTHMIA MODULE")
     logger.info("=" * 60)
 
-    # ── Stage 1: Ingest ───────────────────────────────────────────────────────
+    #Stage 1: Ingest 
     log_module("arrhythmia", "ingest", "started")
     all_dfs: List[pd.DataFrame] = []
 
@@ -304,7 +301,7 @@ def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
     log_module("arrhythmia", "ingest", "done", "Raw beats stored",
                len(combined_df))
 
-    # ── Stage 2: Preprocess ───────────────────────────────────────────────────
+    #Stage 2: Preprocess 
     log_module("arrhythmia", "preprocess", "started")
     import sqlite3 as _sql
     con = _sql.connect(DB_PATH)
@@ -330,7 +327,7 @@ def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
     logger.info("[ARR] %d preprocessed rows stored", len(pre_rows))
     log_module("arrhythmia", "preprocess", "done", "", len(pre_rows))
 
-    # ── Stage 3: Feature extraction ───────────────────────────────────────────
+    #Stage 3: Feature extraction 
     log_module("arrhythmia", "features", "started")
     import sqlite3 as _sql
     con = _sql.connect(DB_PATH)
@@ -368,7 +365,7 @@ def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
     logger.info("[ARR] %d feature rows stored", len(feat_rows))
     log_module("arrhythmia", "features", "done", "", len(feat_rows))
 
-    # ── Stage 4: Train & predict ──────────────────────────────────────────────
+    #Stage 4: Train & predict 
     log_module("arrhythmia", "train", "started")
     feat_load = fetch_arr_features()
     X = feat_load["feature_json"].apply(json.loads).apply(pd.Series).fillna(0.0)
@@ -402,7 +399,6 @@ def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
     ]
     insert_arr_predictions(pred_rows)
 
-    # Save ECG plot segments
     _arr_save_ecg_plot(combined_df, le)
 
     log_module("arrhythmia", "train", "done",
@@ -410,11 +406,10 @@ def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
     logger.info("[ARR] Module complete.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # MODULE 2 — APNEA  (MIMIC-IV Waveform, AASM multi-signal labelling)
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Signal flag functions ─────────────────────────────────────────────────────
+
+# Signal flag functions
 
 def _resp_flag(resp: np.ndarray, fs: int) -> bool:
     """True if Resp shows ≥10s of sustained amplitude suppression."""
@@ -491,7 +486,7 @@ def label_apnea_segment(
     return 0, "normal"
 
 
-# ── Cross-signal features ─────────────────────────────────────────────────────
+#Cross-signal features 
 
 def _cross_signal_features(
     resp: np.ndarray,
@@ -555,7 +550,7 @@ def _cross_signal_features(
     return feats
 
 
-# ── Per-segment full feature extraction ──────────────────────────────────────
+# Per-segment full feature extraction 
 
 def _extract_apnea_features(
     ecg: np.ndarray,
@@ -697,8 +692,6 @@ def _load_mimic_records(n: int = N_MIMIC_RECORDS) -> List[str]:
         with urllib.request.urlopen(url, timeout=30) as resp:
             lines = resp.read().decode().splitlines()
         
-        # lines look like: 'waves/p100/p10014354/'
-        # we need to fetch the RECORDS file inside each to get the actual segments
         valid_paths = []
         for ln in lines:
             if not ln.strip(): continue
@@ -744,14 +737,10 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
 
     for rec_path in record_paths:
         record_name = rec_path.split("/")[-1]
-        # Example rec_path: waves/p100/p10039708/83411188/83411188
-        # pn_dir should be: mimic4wdb/0.1.0/waves/p100/p10039708/83411188
+
         pn_dir = "mimic4wdb/0.1.0/" + "/".join(rec_path.split("/")[:-1])
         
         try:
-            # We want max 10 segments per patient. 
-            # 10 segments * 30 seconds * 320 Hz = 96,000 samples.
-            # Passing sampto ensures wfdb STOPS downloading after 96,000 samples.
             rec = wfdb.rdrecord(record_name, pn_dir=pn_dir, sampto=96000)
         except Exception as exc:
             logger.warning("[APNEA] Could not load %s: %s", record_name, exc)
@@ -910,7 +899,7 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
         logger.error("[APNEA] No segments processed — aborting")
         return
 
-    # ── Stage 4: Train Bidirectional LSTM ─────────────────────────────────────
+    # Stage 4: Train Bidirectional LSTM 
     log_module("apnea", "train", "started")
     if not HAS_TF:
         logger.error("[APNEA] TensorFlow not installed — skipping LSTM training")
@@ -986,9 +975,8 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
     logger.info("[APNEA] Module complete.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # MODULE 3 — SEPSIS
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _sep_preprocess_row(raw: Dict) -> Dict[str, Any]:
     """Derive additional clinical features for one sepsis patient row."""
@@ -1015,7 +1003,7 @@ def run_sepsis_module() -> None:
     logger.info(" SEPSIS MODULE")
     logger.info("=" * 60)
 
-    # ── Stage 1: Ingest ───────────────────────────────────────────────────────
+    # Stage 1: Ingest 
     log_module("sepsis", "ingest", "started")
     sep_path = _resolve("sepsis_icu_synthetic.csv", "sepsis icu synthetic.csv")
     if not sep_path:
@@ -1036,7 +1024,7 @@ def run_sepsis_module() -> None:
     insert_sep_raw(raw_rows)
     log_module("sepsis", "ingest", "done", "Raw patients stored", len(raw_rows))
 
-    # ── Stage 2: Preprocess ───────────────────────────────────────────────────
+    # Stage 2: Preprocess 
     log_module("sepsis", "preprocess", "started")
     import sqlite3 as _sql
     con = _sql.connect(DB_PATH)
@@ -1061,7 +1049,7 @@ def run_sepsis_module() -> None:
     logger.info("[SEP] %d preprocessed rows stored", len(pre_rows))
     log_module("sepsis", "preprocess", "done", "", len(pre_rows))
 
-    # ── Stage 3: Feature extraction ───────────────────────────────────────────
+    # Stage 3: Feature extraction 
     log_module("sepsis", "features", "started")
     import sqlite3 as _sql
     con = _sql.connect(DB_PATH)
@@ -1111,7 +1099,7 @@ def run_sepsis_module() -> None:
     logger.info("[SEP] %d feature rows stored", len(feat_rows))
     log_module("sepsis", "features", "done", "", len(feat_rows))
 
-    # ── Stage 4: Train & predict ──────────────────────────────────────────────
+    # Stage 4: Train & predict 
     log_module("sepsis", "train", "started")
     feat_load = fetch_sep_features()
     X = feat_load["feature_json"].apply(json.loads).apply(pd.Series).fillna(0.0)
@@ -1164,10 +1152,6 @@ def run_sepsis_module() -> None:
                f"auc={auc:.4f} acc={accuracy:.4f}", len(pred_rows))
     logger.info("[SEP] Module complete.")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""

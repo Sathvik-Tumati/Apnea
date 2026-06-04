@@ -343,8 +343,6 @@ def init_db(db_path: str = DB_PATH) -> None:
     logger.info("[DB] Schema initialised at %s", db_path)
 
 
-# ── Shared log helper ─────────────────────────────────────────────────────────
-
 def log_module(
     module: str,
     stage: str,
