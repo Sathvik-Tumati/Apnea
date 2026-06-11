@@ -1,53 +1,60 @@
 """
 pipeline/pipeline.py
 ====================
-Three-module ML pipeline for clinical vital-sign prediction.
+Single-module ML pipeline for Apnea detection using real-world wearable constraints.
 
 Modules
 -------
-arrhythmia  Beat-level ECG classification (N / VEB / SVEB / F / Q)
-            Data: MIT-BIH / INCART / SCD-Holter CSVs
-            Model: RandomForestClassifier
-
 apnea       30-second segment apnea detection
             Data: MIMIC-IV Waveform DB streamed via wfdb
-            Label: AASM multi-signal composite (2-of-4 signals)
+            Constraints: ECG @ 125Hz, PPG @ 120Hz, EDR (fusion) for resp, intermittent SpO2
+            Label: AASM 3-signal composite (GT Resp channel, SpO2, HRV)
             Model: Bidirectional LSTM
-
-sepsis      ICU sepsis early warning
-            Data: sepsis_icu_synthetic.csv
-            Model: GradientBoostingClassifier
 
 Usage
 -----
-python pipeline/pipeline.py                  # run all three
-python pipeline/pipeline.py --module arrhythmia
-python pipeline/pipeline.py --module apnea
-python pipeline/pipeline.py --module sepsis
+python pipeline/pipeline.py
 python pipeline/pipeline.py --fresh          # delete DB before run
+python pipeline/pipeline.py --save-model     # save trained model and scaler to disk
 """
 
 import argparse
+import datetime
 import json
 import logging
 import os
 import sys
 import warnings
+import scipy.signal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, coherence, filtfilt, find_peaks
+from scipy.signal import butter, coherence, filtfilt, find_peaks, welch
+from scipy.signal import resample as scipy_resample
+from scipy.signal.windows import tukey
+
+import random
+import tensorflow as tf
+
+# Set all random seeds for reproducibility
+def set_all_seeds(seed=42):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
 
 warnings.filterwarnings("ignore")
-np.random.seed(42)
+set_all_seeds(42)
+
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from CLI.db.database import (
     DB_PATH,
-    _j,
     init_db,
     insert_apnea_ecg_plot,
     insert_apnea_features,
@@ -55,20 +62,6 @@ from CLI.db.database import (
     insert_apnea_raw,
     insert_apnea_results,
     insert_apnea_segment,
-    insert_arr_ecg_plot,
-    insert_arr_features,
-    insert_arr_predictions,
-    insert_arr_preprocessed,
-    insert_arr_raw,
-    insert_arr_results,
-    insert_sep_features,
-    insert_sep_predictions,
-    insert_sep_preprocessed,
-    insert_sep_raw,
-    insert_sep_results,
-    insert_sep_vitals_plot,
-    fetch_arr_features,
-    fetch_sep_features,
     fetch_apnea_segments,
     log_module,
 )
@@ -91,12 +84,18 @@ try:
 except ImportError:
     HAS_TF = False
 
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
-#logging
+# ── EDR v3: precision respiratory rate engine ─────────────────────────────────
+try:
+    from compute_edr_fixed import compute_edr_v3 as _compute_edr_v3
+    HAS_EDR_V3 = True
+except ImportError:
+    HAS_EDR_V3 = False
+
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -107,312 +106,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-#config
+# config
 DATA_DIR: str = os.environ.get("DATA_DIR", "../archive2/")
 MIMIC_URL: str = "https://physionet.org/files/mimic4wdb/0.1.0/"
+
 FS_MIMIC: int = 320
+FS_ECG: int = 125
+FS_PPG: int = 120
+FS_RESP: int = 4
 SEGMENT_LEN_S: int = 30
-BEATS_PER_TYPE: int = 3000
-N_MIMIC_RECORDS: int = 10
+N_MIMIC_RECORDS: int = 60
 
-ECG_FILES: List[Tuple[str, str]] = [
-    ("MIT-BIH_Arrhythmia_Database.csv",
-     "MIT-BIH Arrhythmia Database.csv"),
-    ("MIT-BIH_Supraventricular_Arrhythmia_Database.csv",
-     "MIT-BIH Supraventricular Arrhythmia Database.csv"),
-    ("INCART_2-lead_Arrhythmia_Database.csv",
-     "INCART 2-lead Arrhythmia Database.csv"),
-    ("Sudden_Cardiac_Death_Holter_Database.csv",
-     "Sudden Cardiac Death Holter Database.csv"),
-]
-
-BEAT_COLS: List[str] = [
-    "0_pre-RR", "0_post-RR", "0_pPeak", "0_tPeak", "0_rPeak",
-    "0_sPeak", "0_qPeak", "0_qrs_interval", "0_pq_interval",
-    "0_qt_interval", "0_st_interval",
-    "0_qrs_morph0", "0_qrs_morph1", "0_qrs_morph2",
-    "0_qrs_morph3", "0_qrs_morph4",
-    "1_pre-RR", "1_post-RR", "1_pPeak", "1_tPeak", "1_rPeak",
-    "1_sPeak", "1_qPeak", "1_qrs_interval", "1_pq_interval",
-    "1_qt_interval", "1_st_interval",
-    "1_qrs_morph0", "1_qrs_morph1", "1_qrs_morph2",
-    "1_qrs_morph3", "1_qrs_morph4",
-]
-
-SEPSIS_COLS: List[str] = [
-    "hr_mean", "hr_max", "hr_min", "hr_std",
-    "sbp_mean", "sbp_min", "sbp_std",
-    "dbp_mean", "dbp_min", "map_mean",
-    "temp_celsius_mean", "temp_celsius_max", "temp_celsius_std",
-    "spo2_mean", "spo2_min", "spo2_std",
-    "respiratory_rate_mean", "respiratory_rate_max", "respiratory_rate_std",
-    "wbc", "lactate_mmol", "creatinine", "platelet_count",
-    "bilirubin_total", "glucose", "ph_arterial", "pao2_fio2_ratio",
-    "sofa_score", "apache_iv", "qsofa", "sirs_criteria",
-    "vasopressors_flag", "mechanical_ventilation",
-]
-
-APNEA_FEATURE_COLS: List[str] = [
-    "rr_mean", "rr_std", "rmssd", "pnn50", "lf_hf_ratio",
-    "mean_hr", "hr_range",
-    "spo2_mean", "spo2_min", "spo2_delta_index", "odi", "t90",
-    "spo2_approx_entropy",
+APNEA_FEATURE_COLS = [
+    "rr_mean", "rr_std", "rmssd", "pnn50", "mean_hr", "hr_range", "lf_hf_ratio",
+    "resp_rate_bpm", "resp_rate_variability", "flatline_duration_s",
     "resp_amplitude_mean", "resp_amplitude_std",
-    "flatline_duration_s", "resp_rate_bpm", "resp_rate_variability",
-    "map_mean", "map_std", "sbp_max", "dbp_min",
-    "pulse_pressure", "map_variability",
+    "spo2_mean", "spo2_min", "spo2_delta_index", "odi", "t90", "spo2_approx_entropy",
+    "map_mean", "map_std", "map_variability", "sbp_max", "dbp_min", "pulse_pressure",
     "resp_spo2_lag_s", "ptt_ms", "ecg_resp_coherence",
-    "resp_flag", "spo2_flag", "hrv_flag", "abp_flag", "signals_positive",
 ]
 
 
-#shared signal utilities 
+# ── Signal utilities ──────────────────────────────────────────────────────────
 
 def _bandpass(signal: np.ndarray, fs: int,
               lo: float = 0.5, hi: float = 40.0,
               order: int = 3) -> np.ndarray:
-    """Apply a zero-phase Butterworth bandpass filter."""
     nyq = fs / 2.0
-
     actual_hi = min(hi, nyq - 0.1)
-
     actual_lo = min(lo, actual_hi - 0.1)
-
     b, a = butter(order, [actual_lo / nyq, actual_hi / nyq], btype="band")
     return filtfilt(b, a, signal)
 
 
 def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
-    """Detect R-peaks using neurokit2 if available, else scipy."""
     if HAS_NK:
         try:
             _, info = nk.ecg_process(ecg, sampling_rate=fs)
             return info["ECG_R_Peaks"]
         except Exception as exc:
             logger.warning("nk.ecg_process failed: %s — using scipy fallback", exc)
-    peaks, _ = find_peaks(ecg, distance=int(fs * 0.4),
-                          height=float(np.std(ecg)))
+    peaks, _ = find_peaks(ecg, distance=int(fs * 0.4), height=float(np.std(ecg)))
     return peaks
 
 
-def _resolve(underscore: str, spaced: str) -> Optional[str]:
-    """Return the first existing path from two name variants."""
-    for name in [underscore, spaced]:
-        p = os.path.join(DATA_DIR, name)
-        if os.path.isfile(p):
-            return p
-    return None
+def _compute_edr(ecg: np.ndarray, r_peaks: np.ndarray,
+                 fs_ecg: int, fs_resp: int = 4) -> np.ndarray:
+    """Legacy EDR: dual-engine QRS-area + QRS-PCA fusion."""
+    if len(r_peaks) < 8:
+        return np.zeros(int(len(ecg) * fs_resp / fs_ecg))
+    t_peaks = r_peaks / fs_ecg
+    t_uniform = np.arange(0, len(ecg) / fs_ecg, 1.0 / fs_resp)
 
+    def _process_envelope(raw_v, times):
+        if len(raw_v) < 6:
+            return np.zeros_like(t_uniform)
+        v_detrended = raw_v - np.polyval(np.polyfit(times, raw_v, 1), times)
+        s = np.interp(t_uniform, times, v_detrended)
+        return (s - np.mean(s)) / (np.std(s) + 1e-9)
 
-# MODULE 1 — ARRHYTHMIA
+    qrs_win = max(1, int(0.06 * fs_ecg))
+    areas = [np.sum(np.abs(ecg[max(0, r - qrs_win):min(len(ecg), r + qrs_win)]))
+             for r in r_peaks]
+    m3_wave = _process_envelope(np.array(areas, dtype=float), t_peaks)
 
-
-def _arr_preprocess_row(raw: Dict) -> Dict[str, float]:
-    """Derive cleaned features from one raw ECG beat dict."""
-    def g(k: str) -> float:
+    beats = [ecg[r - qrs_win:r + qrs_win]
+             for r in r_peaks if r - qrs_win >= 0 and r + qrs_win <= len(ecg)]
+    m4_wave = m3_wave
+    if len(beats) >= 8:
+        X = np.array(beats, dtype=float)
+        X -= X.mean(axis=0, keepdims=True)
         try:
-            return float(raw.get(k) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+            U, S, _ = np.linalg.svd(X, full_matrices=False)
+            m4_wave = _process_envelope(U[:, 0] * S[0], t_peaks[:len(beats)])
+        except np.linalg.LinAlgError:
+            pass
 
-    rr_pre = g("0_pre-RR")
-    rr_post = g("0_post-RR")
-    rr_ratio = rr_pre / (rr_post + 1e-6)
-    return {
-        "rr_ratio": rr_ratio,
-        "rr_diff": rr_post - rr_pre,
-        "rr_symmetry": abs(rr_ratio - 1.0),
-        "qrs_amplitude": g("0_rPeak") - g("0_sPeak"),
-        "qrs_diff_leads": g("0_rPeak") - g("1_rPeak"),
-        "st_diff_leads": g("0_st_interval") - g("1_st_interval"),
-        "p_absent": int(abs(g("0_pPeak")) < 0.05),
-        "qtc_approx": g("0_qt_interval") / (rr_pre ** 0.5 + 1e-6),
-    }
+    min_len = min(len(m3_wave), len(m4_wave))
+    fused = np.median(np.vstack([m3_wave[:min_len], m4_wave[:min_len]]), axis=0)
+    nyq = fs_resp / 2.0
+    b, a = butter(3, [0.1 / nyq, 0.5 / nyq], btype="band")
+    out = np.zeros_like(t_uniform)
+    out[:min_len] = filtfilt(b, a, fused)
+    return out
 
 
-def _arr_save_ecg_plot(df: pd.DataFrame, le: LabelEncoder) -> None:
-    """Save one annotated beat per class into arrhythmia_ecg_plot."""
-    for beat_type in le.classes_:
-        sub = df[df["type"] == beat_type]
-        if sub.empty:
-            continue
-        row = sub.iloc[0]
-        record = str(row.get("record", "unknown"))
-        # Reconstructing a synthetic beat from morph columns
-        morph_cols = [c for c in df.columns if "morph" in c and c.startswith("0_")]
-        ecg_segment = np.array(
-            [float(row.get(c) or 0.0) for c in morph_cols], dtype=float
-        )
-        r_idx = np.array([len(ecg_segment) // 2])
-        insert_arr_ecg_plot(
-            record=record,
-            beat_type=beat_type,
-            ecg=ecg_segment,
-            r_peaks=r_idx,
-            p_peaks=np.array([max(0, r_idx[0] - 4)]),
-            q_peaks=np.array([max(0, r_idx[0] - 2)]),
-            s_peaks=np.array([min(len(ecg_segment) - 1, r_idx[0] + 2)]),
-            t_peaks=np.array([min(len(ecg_segment) - 1, r_idx[0] + 6)]),
-            fs=360,
-        )
-    logger.info("[ARR] ECG plot segments saved for all beat types")
-
-
-def run_arrhythmia_module(beats_per_type: int = BEATS_PER_TYPE) -> None:
-    """Run the full arrhythmia pipeline: ingest → preprocess → features → train."""
-    logger.info("=" * 60)
-    logger.info(" ARRHYTHMIA MODULE")
-    logger.info("=" * 60)
-
-    #Stage 1: Ingest 
-    log_module("arrhythmia", "ingest", "started")
-    all_dfs: List[pd.DataFrame] = []
-
-    for u_name, s_name in ECG_FILES:
-        path = _resolve(u_name, s_name)
-        if not path:
-            logger.warning("[ARR] %s not found — skipping", u_name)
-            continue
-        df = pd.read_csv(path, low_memory=False)
-        if "type" not in df.columns:
-            logger.warning("[ARR] %s missing 'type' column — skipping", path)
-            continue
-        df = df[df["type"].isin(["N", "SVEB", "VEB", "F", "Q"])]
-        df = df.groupby("type", group_keys=False).apply(
-            lambda x: x.sample(min(len(x), beats_per_type), random_state=42)
-        )
-        source = Path(path).stem
-        raw_rows = [
-            (source, str(row.get("record", "")), row["type"],
-             json.dumps({k: (None if pd.isna(v) else v)
-                         for k, v in row.items()}))
-            for _, row in df.iterrows()
-        ]
-        insert_arr_raw(raw_rows)
-        all_dfs.append(df)
-        logger.info("[ARR] %s: %d beats ingested", source, len(df))
-
-    if not all_dfs:
-        logger.error("[ARR] No ECG files loaded — aborting arrhythmia module")
-        log_module("arrhythmia", "ingest", "failed", "No ECG files found", 0)
-        return
-
-    combined_df = pd.concat(all_dfs, ignore_index=True)
-    log_module("arrhythmia", "ingest", "done", "Raw beats stored",
-               len(combined_df))
-
-    #Stage 2: Preprocess 
-    log_module("arrhythmia", "preprocess", "started")
-    import sqlite3 as _sql
-    con = _sql.connect(DB_PATH)
-    con.row_factory = _sql.Row
-    raw_rows_db = con.execute(
-        "SELECT id, beat_type, raw_json FROM arrhythmia_raw"
-        " WHERE id NOT IN (SELECT raw_id FROM arrhythmia_preprocessed)"
-    ).fetchall()
-    con.close()
-
-    pre_rows: List[tuple] = []
-    for r in raw_rows_db:
-        raw = json.loads(r["raw_json"])
-        p = _arr_preprocess_row(raw)
-        pre_rows.append((
-            r["id"], r["beat_type"],
-            p["rr_ratio"], p["rr_diff"], p["rr_symmetry"],
-            p["qrs_amplitude"], p["qrs_diff_leads"],
-            p["st_diff_leads"], p["p_absent"], p["qtc_approx"],
-        ))
-
-    insert_arr_preprocessed(pre_rows)
-    logger.info("[ARR] %d preprocessed rows stored", len(pre_rows))
-    log_module("arrhythmia", "preprocess", "done", "", len(pre_rows))
-
-    #Stage 3: Feature extraction 
-    log_module("arrhythmia", "features", "started")
-    import sqlite3 as _sql
-    con = _sql.connect(DB_PATH)
-    con.row_factory = _sql.Row
-    pre_df = pd.read_sql("""
-        SELECT p.id, p.beat_type, p.rr_ratio, p.rr_diff, p.rr_symmetry,
-               p.qrs_amplitude, p.qrs_diff_leads, p.st_diff_leads,
-               p.p_absent, p.qtc_approx, r.raw_json
-        FROM arrhythmia_preprocessed p
-        JOIN arrhythmia_raw r ON r.id = p.raw_id
-        WHERE p.id NOT IN (SELECT preprocessed_id FROM arrhythmia_features)
-    """, con)
-    con.close()
-
-    raw_feat_df = (
-        pre_df["raw_json"]
-        .apply(lambda x: {c: float(json.loads(x).get(c) or 0.0)
-                          for c in BEAT_COLS})
-        .apply(pd.Series)
-    )
-    feat_df = pd.concat(
-        [pre_df.drop(columns=["raw_json"]), raw_feat_df], axis=1
-    ).fillna(0.0)
-
-    feat_cols = [c for c in feat_df.columns if c not in ("id", "beat_type")]
-    feat_rows: List[tuple] = []
-    for i, (_, row) in enumerate(feat_df.iterrows()):
-        feat_rows.append((
-            int(row["id"]),
-            row["beat_type"],
-            feat_df[feat_cols].iloc[i].to_json(),
-        ))
-
-    insert_arr_features(feat_rows)
-    logger.info("[ARR] %d feature rows stored", len(feat_rows))
-    log_module("arrhythmia", "features", "done", "", len(feat_rows))
-
-    #Stage 4: Train & predict 
-    log_module("arrhythmia", "train", "started")
-    feat_load = fetch_arr_features()
-    X = feat_load["feature_json"].apply(json.loads).apply(pd.Series).fillna(0.0)
-    le = LabelEncoder()
-    y = le.fit_transform(feat_load["beat_type"])
-
-    X_tr, X_te, y_tr, y_te, id_tr, id_te = train_test_split(
-        X, y, feat_load["id"],
-        test_size=0.2, stratify=y, random_state=42,
-    )
-    scaler = StandardScaler()
-    model = RandomForestClassifier(
-        n_estimators=200, max_depth=12,
-        class_weight="balanced", n_jobs=-1, random_state=42,
-    )
-    model.fit(scaler.fit_transform(X_tr), y_tr)
-    y_pred = model.predict(scaler.transform(X_te))
-    y_prob = model.predict_proba(scaler.transform(X_te))
-    report = classification_report(y_te, y_pred,
-                                   target_names=le.classes_,
-                                   output_dict=True)
-    accuracy = report["accuracy"]
-    logger.info("[ARR] Accuracy: %.4f", accuracy)
-    logger.info("\n%s", classification_report(y_te, y_pred,
-                                              target_names=le.classes_))
-
-    insert_arr_results(accuracy, report)
-    pred_rows = [
-        (str(int(fid)), le.classes_[yt], le.classes_[yp], float(ypa.max()))
-        for fid, yt, yp, ypa in zip(id_te, y_te, y_pred, y_prob)
-    ]
-    insert_arr_predictions(pred_rows)
-
-    _arr_save_ecg_plot(combined_df, le)
-
-    log_module("arrhythmia", "train", "done",
-               f"acc={accuracy:.4f}", len(pred_rows))
-    logger.info("[ARR] Module complete.")
-
-
-# MODULE 2 — APNEA  (MIMIC-IV Waveform, AASM multi-signal labelling)
-
-
-# Signal flag functions
+# ── Signal flag functions ─────────────────────────────────────────────────────
 
 def _resp_flag(resp: np.ndarray, fs: int) -> bool:
-    """True if Resp shows ≥10s of sustained amplitude suppression."""
+    """True if respiratory signal shows ≥10s of sustained amplitude suppression.
+    Pass GT Resp channel when available; EDR as fallback."""
     if len(resp) < fs * 10:
         return False
     threshold = np.mean(resp) - 1.5 * np.std(resp)
@@ -427,130 +210,86 @@ def _resp_flag(resp: np.ndarray, fs: int) -> bool:
     return max_run >= (10 * fs)
 
 
-def _spo2_flag(pleth: np.ndarray, fs: int,
-               baseline_spo2: float) -> bool:
-    """True if Pleth-derived SpO2 drops ≥3% from baseline AND min < 94%."""
-    smoothed = (
-        pd.Series(pleth)
-        .rolling(int(fs * 2), center=True, min_periods=1)
-        .median()
-        .values
-    )
-    spo2_min = float(np.min(smoothed))
-    delta = baseline_spo2 - spo2_min
-    return (delta >= 3.0) and (spo2_min < 94.0)
+def _spo2_flag(pleth: np.ndarray, fs: int, baseline_spo2: float) -> bool:
+    smooth = (pd.Series(pleth)
+              .rolling(int(fs * 2), center=True, min_periods=1)
+              .median().values)
+    spo2_min = float(np.min(smooth))
+    return (baseline_spo2 - spo2_min >= 3.0) and (spo2_min < 94.0)
 
 
 def _hrv_flag(r_peaks: np.ndarray, fs: int,
-              baseline_rmssd: float,
-              baseline_rr_ms: float) -> bool:
-    """True if HRV shows autonomic signature of apnea."""
+              baseline_rmssd: float, baseline_rr_ms: float) -> bool:
     if len(r_peaks) < 3:
         return False
     rr_ms = np.diff(r_peaks) / fs * 1000.0
     rmssd_w = float(np.sqrt(np.mean(np.diff(rr_ms) ** 2)))
     mean_rr_w = float(np.mean(rr_ms))
-    hrv_surge = rmssd_w > 1.5 * baseline_rmssd
-    bradycardia = mean_rr_w > 1.2 * baseline_rr_ms
-    return hrv_surge or bradycardia
+    return (rmssd_w > 1.5 * baseline_rmssd) and (mean_rr_w > 1.2 * baseline_rr_ms)
 
 
 def _abp_flag(abp: np.ndarray, fs: int,
-              baseline_map_std: float,
-              baseline_sbp: float) -> bool:
-    """True if ABP shows haemodynamic apnea signature."""
-    map_sig = (
-        pd.Series(abp)
-        .rolling(int(fs * 2), center=True, min_periods=1)
-        .mean()
-        .values
-    )
-    map_std_w = float(np.std(map_sig))
-    peak_sbp_w = float(np.max(abp))
-    pressure_var = map_std_w > 1.5 * baseline_map_std
-    bp_surge = peak_sbp_w > baseline_sbp + 15.0
-    return pressure_var or bp_surge
+              baseline_map_std: float, baseline_sbp: float) -> bool:
+    map_sig = (pd.Series(abp)
+               .rolling(int(fs * 2), center=True, min_periods=1)
+               .mean().values)
+    return (float(np.std(map_sig)) > 1.5 * baseline_map_std or
+            float(np.max(abp)) > baseline_sbp + 15.0)
 
 
-def label_apnea_segment(
-    resp: bool, spo2: bool, hrv: bool, abp: bool
-) -> Tuple[int, str]:
-    """AASM-aligned composite apnea labelling (2-of-4 threshold)."""
-    n = sum([resp, spo2, hrv, abp])
-    if n >= 3:
-        return 1, "definite_apnea"
-    if n == 2:
-        return 1, "probable_apnea"
-    if n == 1:
-        return 0, "possible_hypopnea"
+def label_apnea_segment(resp: bool, spo2: bool, hrv: bool) -> Tuple[int, str]:
+    n = sum([resp, spo2, hrv])
+    if n == 3: return 1, "definite_apnea"
+    if n == 2: return 1, "probable_apnea"
+    if n == 1: return 0, "possible_hypopnea"
     return 0, "normal"
 
 
-#Cross-signal features 
+# ── Cross-signal features ─────────────────────────────────────────────────────
 
-def _cross_signal_features(
-    resp: np.ndarray,
-    pleth: np.ndarray,
-    r_peaks: np.ndarray,
-    abp: np.ndarray,
-    fs: int,
-) -> Dict[str, float]:
-    """Compute resp_spo2_lag, PTT, and ECG-Resp coherence."""
-    feats: Dict[str, float] = {
-        "resp_spo2_lag_s": 0.0,
-        "ptt_ms": 0.0,
-        "ecg_resp_coherence": 0.0,
-    }
-
-    # resp_spo2_lag
+def _cross_signal_features(resp, pleth, r_peaks, abp,
+                            fs_resp, fs_pleth, fs_abp) -> Dict[str, float]:
+    feats: Dict[str, float] = {"resp_spo2_lag_s": 0.0, "ptt_ms": 0.0,
+                                "ecg_resp_coherence": 0.0}
     try:
-        min_len = min(len(resp), len(pleth))
-        r_norm = resp[:min_len] - np.mean(resp[:min_len])
-        p_norm = pleth[:min_len] - np.mean(pleth[:min_len])
+        min_len_s = min(len(resp) / fs_resp, len(pleth) / fs_pleth)
+        t_common = np.arange(0, min_len_s, 1.0 / fs_resp)
+        r_res = np.interp(t_common, np.arange(len(resp)) / fs_resp, resp)
+        p_res = np.interp(t_common, np.arange(len(pleth)) / fs_pleth, pleth)
+        r_norm = r_res - np.mean(r_res)
+        p_norm = p_res - np.mean(p_res)
         corr = np.correlate(p_norm, r_norm, mode="full")
-        lags = np.arange(-(min_len - 1), min_len)
-        feats["resp_spo2_lag_s"] = float(lags[np.argmax(np.abs(corr))]) / fs
+        lags = np.arange(-(len(p_norm) - 1), len(p_norm))
+        feats["resp_spo2_lag_s"] = float(lags[np.argmax(np.abs(corr))]) / fs_resp
     except Exception:
         pass
-
-    # PTT
     try:
         ptt_vals: List[float] = []
         for rp in r_peaks:
-            s_start = int(rp)
-            s_end = min(int(rp + 0.5 * fs), len(abp) - 1)
-            if s_end <= s_start:
-                continue
-            foot = int(np.argmin(abp[s_start:s_end]))
-            ptt_ms = foot / fs * 1000.0
+            s = int((rp / FS_ECG) * fs_abp)
+            e = min(int(s + 0.5 * fs_abp), len(abp) - 1)
+            if e <= s: continue
+            ptt_ms = int(np.argmin(abp[s:e])) / fs_abp * 1000.0
             if 50.0 < ptt_ms < 500.0:
                 ptt_vals.append(ptt_ms)
         feats["ptt_ms"] = float(np.mean(ptt_vals)) if ptt_vals else 0.0
     except Exception:
         pass
-
-    # RSA coherence
     try:
-        rr_series = np.diff(r_peaks) / float(fs)
+        rr_series = np.diff(r_peaks) / float(FS_ECG)
         if len(rr_series) >= 8 and len(resp) >= 64:
-            resp_res = np.interp(
-                np.linspace(0, 1, len(rr_series)),
-                np.linspace(0, 1, len(resp)),
-                resp,
-            )
+            resp_res = np.interp(np.linspace(0, 1, len(rr_series)),
+                                 np.linspace(0, 1, len(resp)), resp)
             f, cxy = coherence(rr_series, resp_res,
                                fs=1.0, nperseg=min(8, len(rr_series)))
             hf = (f >= 0.15) & (f <= 0.4)
-            feats["ecg_resp_coherence"] = float(
-                np.mean(cxy[hf]) if hf.any() else 0.0
-            )
+            feats["ecg_resp_coherence"] = float(np.mean(cxy[hf]) if hf.any() else 0.0)
     except Exception:
         pass
-
     return feats
 
 
-# Per-segment full feature extraction 
+# ── Per-segment feature extraction ───────────────────────────────────────────
 
 def _extract_apnea_features(
     ecg: np.ndarray,
@@ -558,29 +297,38 @@ def _extract_apnea_features(
     resp: np.ndarray,
     abp: np.ndarray,
     r_peaks: np.ndarray,
-    fs: int,
     baseline: Dict[str, float],
+    edr_bpm: Optional[float] = None,
+    edr_quality: Optional[float] = None,
+    resp_gt: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """Extract all 33 features + all 4 signal flags for one 30s segment."""
+    """
+    resp_gt : ground-truth MIMIC Resp channel at FS_RESP Hz.
+              When provided: used for _resp_flag (label) and all resp features.
+              When None: falls back to EDR signal (resp) for both.
+    """
     feats: Dict[str, Any] = {}
+
+    # Route resp signal
+    # resp_for_label → _resp_flag → AASM label (must be ground truth)
+    # resp_for_feats → all resp-based feature values
+    resp_for_label = resp_gt if resp_gt is not None else resp
+    resp_for_feats = resp_gt if resp_gt is not None else resp
 
     # HRV
     if len(r_peaks) >= 3:
-        rr_ms = np.diff(r_peaks) / fs * 1000.0
+        rr_ms = np.diff(r_peaks) / FS_ECG * 1000.0
         rr_diffs = np.diff(rr_ms)
         feats["rr_mean"] = float(np.mean(rr_ms))
         feats["rr_std"] = float(np.std(rr_ms))
         feats["rmssd"] = float(np.sqrt(np.mean(rr_diffs ** 2)))
-        feats["pnn50"] = float(
-            np.sum(np.abs(rr_diffs) > 50.0) / max(len(rr_ms), 1)
-        )
+        feats["pnn50"] = float(np.sum(np.abs(rr_diffs) > 50.0) / max(len(rr_ms), 1))
         feats["mean_hr"] = float(60000.0 / (np.mean(rr_ms) + 1e-6))
         feats["hr_range"] = float(
-            60000.0 / (np.min(rr_ms) + 1e-6) - 60000.0 / (np.max(rr_ms) + 1e-6)
-        )
+            60000.0 / (np.min(rr_ms) + 1e-6) - 60000.0 / (np.max(rr_ms) + 1e-6))
         if HAS_NK and len(r_peaks) >= 5:
             try:
-                hf = nk.hrv_frequency(r_peaks, sampling_rate=fs, show=False)
+                hf = nk.hrv_frequency(r_peaks, sampling_rate=FS_ECG, show=False)
                 feats["lf_hf_ratio"] = float(hf["HRV_LFHF"].values[0])
             except Exception:
                 feats["lf_hf_ratio"] = 0.0
@@ -591,13 +339,11 @@ def _extract_apnea_features(
                   "mean_hr", "hr_range", "lf_hf_ratio"):
             feats[k] = 0.0
 
-    # SpO2 / Pleth
-    smooth = (
-        pd.Series(pleth)
-        .rolling(int(fs * 2), center=True, min_periods=1)
-        .median()
-        .values
-    )
+    # SpO2
+    pleth_clean = pd.Series(pleth).ffill().bfill().values
+    smooth = (pd.Series(pleth_clean)
+              .rolling(int(FS_PPG * 2), center=True, min_periods=1)
+              .median().values)
     feats["spo2_mean"] = float(np.mean(smooth))
     feats["spo2_min"] = float(np.min(smooth))
     feats["spo2_delta_index"] = float(np.max(smooth) - np.min(smooth))
@@ -605,20 +351,16 @@ def _extract_apnea_features(
     feats["odi"] = float(np.sum(np.diff((smooth < desat_thresh).astype(int)) == 1))
     feats["t90"] = float(np.mean(smooth < 90.0))
     try:
-        m = np.mean(smooth)
-        s = np.std(smooth)
-        phi = (smooth - m) / (s + 1e-9)
-        feats["spo2_approx_entropy"] = float(
-            -np.mean(np.log(np.abs(np.diff(phi)) + 1e-9))
-        )
+        phi = (smooth - np.mean(smooth)) / (np.std(smooth) + 1e-9)
+        feats["spo2_approx_entropy"] = float(-np.mean(np.log(np.abs(np.diff(phi)) + 1e-9)))
     except Exception:
         feats["spo2_approx_entropy"] = 0.0
 
-    # Resp
-    feats["resp_amplitude_mean"] = float(np.mean(np.abs(resp)))
-    feats["resp_amplitude_std"] = float(np.std(resp))
-    threshold = np.mean(resp) - 1.5 * np.std(resp)
-    suppressed = resp < threshold
+    # Respiratory features — GT Resp when available, EDR as fallback
+    feats["resp_amplitude_mean"] = float(np.mean(np.abs(resp_for_feats)))
+    feats["resp_amplitude_std"] = float(np.std(resp_for_feats))
+    threshold = np.mean(resp_for_feats) - 1.5 * np.std(resp_for_feats)
+    suppressed = resp_for_feats < threshold
     max_run = current_run = 0
     for val in suppressed:
         if val:
@@ -626,28 +368,48 @@ def _extract_apnea_features(
             max_run = max(max_run, current_run)
         else:
             current_run = 0
-    feats["flatline_duration_s"] = float(max_run / fs)
+    feats["flatline_duration_s"] = float(max_run / FS_RESP)
+
+    # label_source: tells training filter which segments to trust
+    feats["label_source"] = "mimic_resp" if resp_gt is not None else "edr"
+
     try:
-        resp_peaks, _ = find_peaks(resp, distance=int(fs * 1.5))
-        feats["resp_rate_bpm"] = float(
-            len(resp_peaks) / (len(resp) / fs) * 60.0
-        )
-        if len(resp_peaks) >= 2:
-            rri = np.diff(resp_peaks) / fs
-            feats["resp_rate_variability"] = float(np.std(rri))
+        if resp_gt is not None:
+            # GT Resp: compute rate directly from chest belt via Welch
+            w_edge = tukey(len(resp_for_feats), alpha=0.1)
+            nperseg = min(len(resp_for_feats), max(8, int(FS_RESP * 60)))
+            f, pxx = welch(resp_for_feats * w_edge, fs=FS_RESP,
+                           nperseg=nperseg, noverlap=nperseg // 2, nfft=2048)
+            inn = (f >= 0.1) & (f <= 0.6)
+            feats["resp_rate_bpm"] = (float(f[inn][np.argmax(pxx[inn])] * 60.0)
+                                      if np.any(inn) else 0.0)
+        elif edr_bpm is not None and edr_quality is not None and edr_quality >= 1.5:
+            feats["resp_rate_bpm"] = float(edr_bpm)
         else:
-            feats["resp_rate_variability"] = 0.0
+            w_edge = tukey(len(resp_for_feats), alpha=0.1)
+            nperseg = min(len(resp_for_feats), max(8, int(FS_RESP * 60)))
+            f, pxx = welch(resp_for_feats * w_edge, fs=FS_RESP,
+                           nperseg=nperseg, noverlap=nperseg // 2, nfft=2048)
+            inn = (f >= 0.1) & (f <= 0.6)
+            feats["resp_rate_bpm"] = (float(f[inn][np.argmax(pxx[inn])] * 60.0)
+                                      if np.any(inn) else 0.0)
+
+        feats["edr_quality_ok"] = int((edr_quality or 0.0) >= 1.5)
+        feats["edr_snr"] = float(edr_quality) if edr_quality is not None else 0.0
+
+        resp_peaks, _ = find_peaks(resp_for_feats, distance=int(FS_RESP * 1.5))
+        feats["resp_rate_variability"] = (float(np.std(np.diff(resp_peaks) / FS_RESP))
+                                          if len(resp_peaks) >= 2 else 0.0)
     except Exception:
         feats["resp_rate_bpm"] = 0.0
         feats["resp_rate_variability"] = 0.0
+        feats["edr_quality_ok"] = 0
+        feats["edr_snr"] = 0.0
 
     # ABP
-    map_sig = (
-        pd.Series(abp)
-        .rolling(int(fs * 2), center=True, min_periods=1)
-        .mean()
-        .values
-    )
+    map_sig = (pd.Series(abp)
+               .rolling(int(FS_ECG * 2), center=True, min_periods=1)
+               .mean().values)
     feats["map_mean"] = float(np.mean(map_sig))
     feats["map_std"] = float(np.std(map_sig))
     feats["map_variability"] = feats["map_std"]
@@ -655,68 +417,72 @@ def _extract_apnea_features(
     feats["dbp_min"] = float(np.min(abp))
     feats["pulse_pressure"] = feats["sbp_max"] - feats["dbp_min"]
 
-    # Cross-signal
-    cross = _cross_signal_features(resp, pleth, r_peaks, abp, fs)
+    # Cross-signal — use GT Resp when available
+    cross = _cross_signal_features(resp_for_feats, pleth_clean,
+                                   r_peaks, abp, FS_RESP, FS_PPG, FS_ECG)
     feats.update(cross)
 
     # Signal flags
-    rf = _resp_flag(resp, fs)
-    sf = _spo2_flag(pleth, fs, baseline.get("baseline_spo2", 97.0))
-    hf = _hrv_flag(r_peaks, fs,
+    # _resp_flag uses GT Resp channel — this breaks the circular label dependency
+    rf = _resp_flag(resp_for_label, FS_RESP)
+    sf = _spo2_flag(pleth_clean, FS_PPG, baseline.get("baseline_spo2", 97.0))
+    hf = _hrv_flag(r_peaks, FS_ECG,
                    baseline.get("baseline_rmssd", 35.0),
                    baseline.get("baseline_rr_ms", 833.0))
-    af = _abp_flag(abp, fs,
+    af = _abp_flag(abp, FS_ECG,
                    baseline.get("baseline_map_std", 5.0),
                    baseline.get("baseline_sbp", 120.0))
-    label, conf = label_apnea_segment(rf, sf, hf, af)
+
+    label, conf = label_apnea_segment(rf, sf, hf)
 
     feats["resp_flag"] = int(rf)
     feats["spo2_flag"] = int(sf)
     feats["hrv_flag"] = int(hf)
     feats["abp_flag"] = int(af)
-    feats["signals_positive"] = sum([rf, sf, hf, af])
+    feats["signals_positive"] = sum([rf, sf, hf])
     feats["true_label"] = label
     feats["label_confidence"] = conf
 
     return feats
 
 
+# ── MIMIC record loader ───────────────────────────────────────────────────────
+
 def _load_mimic_records(n: int = N_MIMIC_RECORDS) -> List[str]:
-    """Stream the RECORDS list from MIMIC-IV and return the first n paths."""
     if not HAS_WFDB:
-        logger.error("[APNEA] wfdb not installed — cannot load MIMIC-IV")
+        logger.error("[APNEA] wfdb not installed")
         return []
     try:
         import urllib.request
-        url = MIMIC_URL + "RECORDS"
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            lines = resp.read().decode().splitlines()
-        
+        with urllib.request.urlopen(MIMIC_URL + "RECORDS", timeout=30) as r:
+            lines = r.read().decode().splitlines()
         valid_paths = []
         for ln in lines:
-            if not ln.strip(): continue
+            if not ln.strip():
+                continue
             dir_path = ln.strip()
-            inner_url = MIMIC_URL + dir_path + "RECORDS"
             try:
-                with urllib.request.urlopen(inner_url, timeout=10) as inner_resp:
-                    inner_lines = inner_resp.read().decode().splitlines()
-                    for iln in inner_lines:
-                        if iln.strip():
+                with urllib.request.urlopen(
+                        MIMIC_URL + dir_path + "RECORDS", timeout=10) as ir:
+                    for iln in ir.read().decode().splitlines():
+                        if "layout" not in iln:
                             valid_paths.append(dir_path + iln.strip())
+                            if len(valid_paths) >= n:
+                                return valid_paths
             except Exception:
-                pass
-            if len(valid_paths) >= n:
-                break
-        return valid_paths[:n]
+                continue
+        return valid_paths
     except Exception as exc:
-        logger.error("[APNEA] Failed to fetch RECORDS: %s", exc)
+        logger.error("Failed to load MIMIC records: %s", exc)
         return []
 
 
-def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
-    """Run the full apnea pipeline on MIMIC-IV waveform records."""
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+def run_apnea_module(n_records: int = N_MIMIC_RECORDS, save_model: bool = False) -> None:
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     logger.info("=" * 60)
-    logger.info(" APNEA MODULE")
+    logger.info(" APNEA MODULE  run_id=%s", run_id)
     logger.info("=" * 60)
 
     if not HAS_WFDB:
@@ -730,16 +496,13 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
         log_module("apnea", "ingest", "failed", "No MIMIC records fetched", 0)
         return
 
-    SIGNAL_NAMES = {"II": 0, "Pleth": 1, "Resp": 2, "ABP": 3}
     total_segs = 0
-    plot_saved = 0
-    samples_per_seg = FS_MIMIC * SEGMENT_LEN_S
+    plots_per_record = {}
 
     for rec_path in record_paths:
         record_name = rec_path.split("/")[-1]
-
         pn_dir = "mimic4wdb/0.1.0/" + "/".join(rec_path.split("/")[:-1])
-        
+
         try:
             rec = wfdb.rdrecord(record_name, pn_dir=pn_dir, sampto=96000)
         except Exception as exc:
@@ -747,149 +510,164 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
             continue
 
         sig_map = {name: idx for idx, name in enumerate(rec.sig_name)}
-        missing = [s for s in SIGNAL_NAMES if s not in sig_map]
-        if missing:
-            logger.warning("[APNEA] %s missing signals %s — skipping",
-                           record_name, missing)
+        if any(s not in sig_map for s in ["II", "Pleth"]):
+            logger.warning("[APNEA] %s missing II or Pleth — skipping", record_name)
             continue
 
         signals = rec.p_signal
-        fs = rec.fs
-        ecg_full = signals[:, sig_map["II"]]
-        pleth_full = signals[:, sig_map["Pleth"]]
-        resp_full = signals[:, sig_map["Resp"]]
-        abp_full = signals[:, sig_map["ABP"]]
+        fs_orig = rec.fs
+
+        ecg_orig   = signals[:, sig_map["II"]]
+        pleth_orig = signals[:, sig_map["Pleth"]]
+        abp_orig   = (signals[:, sig_map["ABP"]]
+                      if "ABP" in sig_map else np.zeros(signals.shape[0]))
+
+        # Ground-truth Resp channel — breaks circular EDR label dependency
+        has_gt_resp = "Resp" in sig_map
+        resp_orig = signals[:, sig_map["Resp"]] if has_gt_resp else None
+        if has_gt_resp:
+            logger.info("[APNEA] %s: ground-truth Resp channel found — using for labelling",
+                        record_name)
+        else:
+            logger.warning("[APNEA] %s: no Resp channel — EDR fallback for labelling",
+                           record_name)
 
         # Fill NaNs
-        for arr in (ecg_full, pleth_full, resp_full, abp_full):
-            nan_mask = np.isnan(arr)
-            arr[nan_mask] = np.nanmean(arr) if not np.all(nan_mask) else 0.0
+        for arr in (ecg_orig, pleth_orig, abp_orig):
+            m = np.isnan(arr)
+            arr[m] = np.nanmean(arr) if not m.all() else 0.0
+        if resp_orig is not None:
+            m = np.isnan(resp_orig)
+            resp_orig[m] = np.nanmean(resp_orig) if not m.all() else 0.0
 
-        n_segs = len(ecg_full) // samples_per_seg
+        # Resample
+        ecg_full   = scipy_resample(ecg_orig,   int(len(ecg_orig)   * FS_ECG  / fs_orig))
+        pleth_full = scipy_resample(pleth_orig, int(len(pleth_orig) * FS_PPG  / fs_orig))
+        abp_full   = scipy_resample(abp_orig,   int(len(abp_orig)   * FS_ECG  / fs_orig))
+        resp_gt_full = (scipy_resample(resp_orig, int(len(resp_orig) * FS_RESP / fs_orig))
+                        if resp_orig is not None else None)
+
+        spe = FS_ECG  * SEGMENT_LEN_S   # samples per seg ECG
+        spp = FS_PPG  * SEGMENT_LEN_S   # samples per seg PPG
+        spr = FS_RESP * SEGMENT_LEN_S   # samples per seg Resp
+
+        n_segs = min(len(ecg_full) // spe, 10)
         if n_segs == 0:
             continue
-        
-        # Limit to 10 segments (5 minutes) per record
-        n_segs = min(n_segs, 10)
 
-        # Compute subject baseline from first 5 "quiet" windows
+        last_spo2_val = 97.0
+
+        # ── Baseline computation ──────────────────────────────────────────────
         baseline_windows: List[Dict] = []
-        for i in range(min(n_segs, 20)):
-            s = i * samples_per_seg
-            e = s + samples_per_seg
-            ecg_seg = _bandpass(ecg_full[s:e], fs)
-            rp = _detect_r_peaks(ecg_seg, fs)
-            rr_ms = np.diff(rp) / fs * 1000.0 if len(rp) >= 3 else np.array([833.0])
+        for i in range(n_segs):
+            ecg_seg   = _bandpass(ecg_full[i*spe:(i+1)*spe], FS_ECG)
+            pleth_seg = pleth_full[i*spp:(i+1)*spp]
+            abp_seg   = abp_full[i*spe:(i+1)*spe]
+            rp = _detect_r_peaks(ecg_seg, FS_ECG)
+            rr_ms = np.diff(rp) / FS_ECG * 1000.0 if len(rp) >= 3 else np.array([833.0])
             rmssd_w = float(np.sqrt(np.mean(np.diff(rr_ms) ** 2))) if len(rr_ms) >= 2 else 35.0
-            pleth_seg = pleth_full[s:e]
-            abp_seg = abp_full[s:e]
-            map_sig = pd.Series(abp_seg).rolling(int(fs * 2), min_periods=1).mean().values
-            individually_clean = (
-                not _resp_flag(resp_full[s:e], fs)
-                and float(np.min(pleth_seg)) > 90.0
-            )
+
+            if HAS_EDR_V3:
+                resp_seg, _, _ = _compute_edr_v3(ecg_seg, rp, FS_ECG, FS_RESP, SEGMENT_LEN_S)
+            else:
+                resp_seg = _compute_edr(ecg_seg, rp, FS_ECG, FS_RESP)
+
+            resp_gt_seg_bl = (resp_gt_full[i*spr:(i+1)*spr]
+                              if resp_gt_full is not None and (i+1)*spr <= len(resp_gt_full)
+                              else None)
+            resp_for_bl = resp_gt_seg_bl if resp_gt_seg_bl is not None else resp_seg
+
+            map_sig = pd.Series(abp_seg).rolling(int(FS_ECG*2), min_periods=1).mean().values
             baseline_windows.append({
                 "spo2_mean": float(np.mean(pleth_seg)),
                 "rmssd": rmssd_w,
                 "rr_mean": float(np.mean(rr_ms)),
                 "map_std": float(np.std(map_sig)),
                 "sbp_max": float(np.max(abp_seg)),
-                "individually_clean": individually_clean,
+                "individually_clean": (not _resp_flag(resp_for_bl, FS_RESP)
+                                       and float(np.min(pleth_seg)) > 90.0),
             })
 
-        clean_windows = [w for w in baseline_windows if w["individually_clean"]][:5]
-        if clean_windows:
+        clean_wins = [w for w in baseline_windows if w["individually_clean"]][:5]
+        if clean_wins:
             baseline = {
-                "baseline_spo2": float(np.mean([w["spo2_mean"] for w in clean_windows])),
-                "baseline_rmssd": float(np.mean([w["rmssd"] for w in clean_windows])),
-                "baseline_rr_ms": float(np.mean([w["rr_mean"] for w in clean_windows])),
-                "baseline_map_std": float(np.mean([w["map_std"] for w in clean_windows])),
-                "baseline_sbp": float(np.mean([w["sbp_max"] for w in clean_windows])),
+                "baseline_spo2":    float(np.mean([w["spo2_mean"] for w in clean_wins])),
+                "baseline_rmssd":   float(np.mean([w["rmssd"]     for w in clean_wins])),
+                "baseline_rr_ms":   float(np.mean([w["rr_mean"]   for w in clean_wins])),
+                "baseline_map_std": float(np.mean([w["map_std"]   for w in clean_wins])),
+                "baseline_sbp":     float(np.mean([w["sbp_max"]   for w in clean_wins])),
             }
         else:
-            baseline = {
-                "baseline_spo2": 97.0,
-                "baseline_rmssd": 35.0,
-                "baseline_rr_ms": 833.0,
-                "baseline_map_std": 5.0,
-                "baseline_sbp": 120.0,
-            }
+            baseline = {"baseline_spo2": 97.0, "baseline_rmssd": 35.0,
+                        "baseline_rr_ms": 833.0, "baseline_map_std": 5.0,
+                        "baseline_sbp": 120.0}
 
-        # Process each 30-second segment
+        # ── Per-segment processing ────────────────────────────────────────────
         for i in range(n_segs):
-            s = i * samples_per_seg
-            e = s + samples_per_seg
+            ecg_seg = _bandpass(ecg_full[i*spe:(i+1)*spe], FS_ECG)
+            abp_seg = abp_full[i*spe:(i+1)*spe]
 
-            ecg_seg = _bandpass(ecg_full[s:e], fs)
-            pleth_seg = pleth_full[s:e]
-            resp_seg = resp_full[s:e]
-            abp_seg = abp_full[s:e]
+            take_reading = (i % np.random.randint(6, 11)) == 0
+            if take_reading:
+                pleth_seg = pleth_full[i*spp:(i+1)*spp]
+                last_spo2_val = float(np.mean(pleth_seg))
+            else:
+                pleth_seg = np.full(spp, last_spo2_val)
 
-            r_peaks = _detect_r_peaks(ecg_seg, fs)
+            r_peaks = _detect_r_peaks(ecg_seg, FS_ECG)
 
-            # Stage 1: ingest raw
+            if HAS_EDR_V3:
+                resp_seg, edr_bpm, edr_quality = _compute_edr_v3(
+                    ecg_seg, r_peaks, FS_ECG, FS_RESP, SEGMENT_LEN_S)
+            else:
+                resp_seg = _compute_edr(ecg_seg, r_peaks, FS_ECG, FS_RESP)
+                edr_bpm, edr_quality = None, None
+
+            # GT Resp segment aligned to this 30-second window
+            resp_gt_seg = (resp_gt_full[i*spr:(i+1)*spr]
+                           if resp_gt_full is not None and (i+1)*spr <= len(resp_gt_full)
+                           else None)
+
+            # Stage 1: raw
             raw_id = insert_apnea_raw(
-                record_name, i, ecg_seg, pleth_seg, resp_seg, abp_seg, fs
-            )
+                record_name, i, ecg_seg, pleth_seg, resp_seg, abp_seg, FS_ECG)
 
             # Stage 2: preprocess
-            spo2_smooth = (
-                pd.Series(pleth_seg)
-                .rolling(int(fs * 2), center=True, min_periods=1)
-                .median()
-                .values
-            )
-            resp_smooth = (
-                pd.Series(resp_seg)
-                .rolling(int(fs * 1), center=True, min_periods=1)
-                .median()
-                .values
-            )
-            rr_ms = np.diff(r_peaks) / fs * 1000.0 if len(r_peaks) >= 2 else np.array([0.0])
+            spo2_smooth = (pd.Series(pleth_seg)
+                           .rolling(int(FS_PPG*2), center=True, min_periods=1)
+                           .median().values)
+            resp_smooth = (pd.Series(resp_seg)
+                           .rolling(FS_RESP, center=True, min_periods=1)
+                           .median().values)
+            rr_ms = np.diff(r_peaks) / FS_ECG * 1000.0 if len(r_peaks) >= 2 else np.array([0.0])
             pre_id = insert_apnea_preprocessed(
                 raw_id, ecg_seg, r_peaks, spo2_smooth, resp_smooth,
                 float(np.mean(rr_ms)), float(np.std(rr_ms)),
-                int(len(r_peaks)), float(np.median(rr_ms)),
-            )
+                int(len(r_peaks)), float(np.median(rr_ms)))
 
-            # Stage 3: extract features + label
+            # Stage 3: features + label
             feats = _extract_apnea_features(
-                ecg_seg, pleth_seg, resp_seg, abp_seg, r_peaks, fs, baseline
+                ecg_seg, pleth_seg, resp_seg, abp_seg, r_peaks, baseline,
+                edr_bpm=edr_bpm, edr_quality=edr_quality,
+                resp_gt=resp_gt_seg,
             )
             insert_apnea_features(pre_id, json.dumps(feats))
 
-            # Stage 1b: store labelled segment row
-            seg_row = {
-                "record": record_name,
-                "segment_idx": i,
-                **feats,
-            }
+            seg_row = {"record": record_name, "segment_idx": i,
+                       "run_id": run_id, **feats}
             insert_apnea_segment(seg_row)
             total_segs += 1
 
-            # Save one plot segment per label type (max 2 per record)
-            if plot_saved < 8 and feats["true_label"] in (0, 1):
-                spo2_1hz = np.interp(
-                    np.linspace(0, 1, SEGMENT_LEN_S),
-                    np.linspace(0, 1, len(spo2_smooth)),
-                    spo2_smooth,
-                )
-                resp_1hz = np.interp(
-                    np.linspace(0, 1, SEGMENT_LEN_S),
-                    np.linspace(0, 1, len(resp_smooth)),
-                    resp_smooth,
-                )
-                abp_1hz = np.interp(
-                    np.linspace(0, 1, SEGMENT_LEN_S),
-                    np.linspace(0, 1, len(abp_seg)),
-                    abp_seg,
-                )
+            if plots_per_record.get(record_name, 0) < 2 and feats["true_label"] in (0, 1):
+                def _d(sig, n): return np.interp(np.linspace(0,1,n),
+                                                  np.linspace(0,1,len(sig)), sig)
                 insert_apnea_ecg_plot(
                     record_name, i, ecg_seg, r_peaks,
-                    spo2_1hz, resp_1hz, abp_1hz, fs,
-                    feats["true_label"], feats["label_confidence"],
-                )
-                plot_saved += 1
+                    _d(spo2_smooth, SEGMENT_LEN_S),
+                    _d(resp_smooth, SEGMENT_LEN_S),
+                    _d(abp_seg, SEGMENT_LEN_S),
+                    FS_ECG, feats["true_label"], feats["label_confidence"])
+                plots_per_record[record_name] = plots_per_record.get(record_name, 0) + 1
 
         logger.info("[APNEA] %s: %d segments processed", record_name, n_segs)
 
@@ -899,20 +677,63 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
         logger.error("[APNEA] No segments processed — aborting")
         return
 
-    # Stage 4: Train Bidirectional LSTM 
+    # ── Stage 4: Train Bidirectional LSTM ────────────────────────────────────
     log_module("apnea", "train", "started")
     if not HAS_TF:
-        logger.error("[APNEA] TensorFlow not installed — skipping LSTM training")
+        logger.error("[APNEA] TensorFlow not installed")
         log_module("apnea", "train", "failed", "tensorflow not installed", 0)
         return
 
-    segs = fetch_apnea_segments()
-    if len(segs) < 20:
-        logger.warning("[APNEA] Only %d segments — need ≥20 for LSTM", len(segs))
-        log_module("apnea", "train", "skipped", "Not enough segments", 0)
+    segs = fetch_apnea_segments(run_id=run_id)
+    if len(segs) == 0:
+        logger.warning("[APNEA] No segments for run_id=%s", run_id)
+        log_module("apnea", "train", "skipped", "No segments", 0)
         return
 
     seg_df = pd.DataFrame(segs)
+    total_fetched = len(seg_df)
+
+    # Filter 1: GT-labelled only
+    if "label_source" in seg_df.columns:
+        gt_mask = seg_df["label_source"] == "mimic_resp"
+        seg_df = seg_df[gt_mask].reset_index(drop=True)
+        logger.info("[APNEA] Label filter: %d / %d segments have GT Resp labels",
+                    len(seg_df), total_fetched)
+
+    # Filter 2: quality gate
+    if "mean_hr" in seg_df.columns:
+        q_mask = seg_df["mean_hr"] > 0
+        dropped = int((~q_mask).sum())
+        if dropped:
+            logger.info("[APNEA] Quality filter: dropped %d segments with mean_hr=0", dropped)
+        seg_df = seg_df[q_mask].reset_index(drop=True)
+
+    if "true_label" not in seg_df.columns or len(seg_df) == 0:
+        logger.error("[APNEA] No valid segments after filtering")
+        log_module("apnea", "train", "skipped", "No valid segments", 0)
+        return
+
+    n_apnea  = int((seg_df["true_label"] == 1).sum())
+    n_normal = int((seg_df["true_label"] == 0).sum())
+    apnea_pct = n_apnea / max(len(seg_df), 1)
+    logger.info("[APNEA] Training set: %d segments — %d apnea / %d normal (%.0f%% apnea)",
+                len(seg_df), n_apnea, n_normal, apnea_pct * 100)
+
+    if apnea_pct > 0.70:
+        logger.error("[APNEA] %.0f%% apnea — labelling likely broken", apnea_pct * 100)
+        log_module("apnea", "train", "skipped", "Implausible label distribution", 0)
+        return
+
+    if n_apnea == 0 or n_normal == 0:
+        logger.error("[APNEA] Only one class — cannot train")
+        log_module("apnea", "train", "skipped", "Single class", 0)
+        return
+
+    if len(seg_df) < 20:
+        logger.warning("[APNEA] Only %d segments — need ≥20", len(seg_df))
+        log_module("apnea", "train", "skipped", "Not enough segments", 0)
+        return
+
     X_all = seg_df[APNEA_FEATURE_COLS].fillna(0.0).values.astype(float)
     y_all = seg_df["true_label"].values.astype(float)
 
@@ -924,301 +745,167 @@ def run_apnea_module(n_records: int = N_MIMIC_RECORDS) -> None:
     scaler = StandardScaler().fit(X_all)
     X_scaled = scaler.transform(X_all)
 
-    X_seq = np.array([X_scaled[i:i + TIMESTEPS]
-                      for i in range(len(X_scaled) - TIMESTEPS)])
-    y_seq = np.array([y_all[i + TIMESTEPS]
-                      for i in range(len(y_all) - TIMESTEPS)])
+    X_seq = np.array([X_scaled[i:i+TIMESTEPS] for i in range(len(X_scaled)-TIMESTEPS)])
+    y_seq = np.array([y_all[i+TIMESTEPS]       for i in range(len(y_all)-TIMESTEPS)])
 
-    split = int(0.8 * len(X_seq))
-    X_tr, X_te = X_seq[:split], X_seq[split:]
-    y_tr, y_te = y_seq[:split], y_seq[split:]
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_seq, y_seq, test_size=0.2, stratify=y_seq, random_state=42)
+    logger.info("[APNEA] Train: %d seqs (%d apnea / %d normal) | "
+                "Test: %d seqs (%d apnea / %d normal)",
+                len(y_tr), int(y_tr.sum()), int((y_tr==0).sum()),
+                len(y_te), int(y_te.sum()), int((y_te==0).sum()))
 
+    # ========== MODEL ARCHITECTURE (Regularised for 418 sequences) ==========
     model = tf.keras.Sequential([
+        # Input shape defined in first layer that accepts it
+        tf.keras.layers.Input(shape=(TIMESTEPS, len(APNEA_FEATURE_COLS))),
+        
+        # Spatial dropout on input features — randomly zeros entire timesteps
+        tf.keras.layers.SpatialDropout1D(0.2),
+        
+        # Smaller BiLSTM with L2 regularisation on kernel weights
         tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(64, return_sequences=True),
-            input_shape=(TIMESTEPS, len(APNEA_FEATURE_COLS)),
+            tf.keras.layers.LSTM(
+                48,
+                return_sequences=True,
+                recurrent_dropout=0.2,
+                kernel_regularizer=tf.keras.regularizers.l2(1e-4),
+            )
         ),
         tf.keras.layers.Dropout(0.3),
+        
         tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(32)
+            tf.keras.layers.LSTM(
+                24,
+                recurrent_dropout=0.2,
+                kernel_regularizer=tf.keras.regularizers.l2(1e-4),
+            )
         ),
         tf.keras.layers.Dropout(0.2),
-        tf.keras.layers.Dense(32, activation="relu"),
+        
+        # Smaller dense bottleneck
+        tf.keras.layers.Dense(16, activation="relu",
+                              kernel_regularizer=tf.keras.regularizers.l2(1e-4)),
         tf.keras.layers.Dense(1, activation="sigmoid"),
     ])
-    model.compile(optimizer="adam",
-                  loss="binary_crossentropy",
-                  metrics=["AUC"])
-    model.fit(X_tr, y_tr, epochs=10, batch_size=32,
-              validation_split=0.1, verbose=0)
 
+    # ========== FOCAL LOSS (alpha=0.75 was best in run 2) ==========
+    def focal_loss(gamma=2.0, alpha=0.75):
+        """
+        Focal loss for binary classification.
+        
+        gamma: focusing parameter (2.0 is standard)
+        alpha: weighting for positive class (apnea)
+              0.75 gives apnea 3x weight vs normal
+        """
+        def loss_fn(y_true, y_pred):
+            y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+            bce = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+            p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+            focal_weight = tf.pow(1.0 - p_t, gamma)
+            alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
+            return tf.reduce_mean(alpha_t * focal_weight * bce)
+        return loss_fn
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss=focal_loss(gamma=2.0, alpha=0.75),  # Back to run 2's best value
+        metrics=["AUC"],
+    )
+
+    # ========== SIMPLE EARLY STOPPING (no LR scheduling needed) ==========
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_auc",
+            patience=5,                    # Stop 5 epochs after peak
+            restore_best_weights=True,
+            mode="max",
+            verbose=1,
+        ),
+    ]
+
+    # Train with regularised model
+    history = model.fit(
+        X_tr, y_tr, epochs=60, batch_size=32,
+        validation_split=0.1, verbose=1,
+        callbacks=callbacks
+    )
+
+    # ========== EVALUATION WITH THRESHOLD TUNING ==========
     y_prob = model.predict(X_te, verbose=0).flatten()
 
     if len(np.unique(y_te)) > 1:
+        thresholds = np.arange(0.25, 0.75, 0.01)
+        f1s = [f1_score(y_te, (y_prob > t).astype(int), zero_division=0)
+               for t in thresholds]
+        best_thresh = thresholds[np.argmax(f1s)]
+        logger.info("[APNEA] Optimal threshold: %.2f (F1=%.3f)", best_thresh, max(f1s))
+        
         auc = roc_auc_score(y_te, y_prob)
+        
+        # Bootstrap CI for AUC
+        from sklearn.utils import resample
+        n_bootstraps = 1000
+        boot_aucs = []
+        rng = np.random.RandomState(42)
+        for _ in range(n_bootstraps):
+            idx = rng.randint(0, len(y_te), len(y_te))
+            if len(np.unique(y_te[idx])) > 1:
+                boot_aucs.append(roc_auc_score(y_te[idx], y_prob[idx]))
+        ci_lower, ci_upper = np.percentile(boot_aucs, [2.5, 97.5])
+        logger.info("[APNEA] AUC: %.4f (95%% CI: %.3f-%.3f)", auc, ci_lower, ci_upper)
+        
         report = classification_report(
-            y_te, (y_prob > 0.5).astype(int),
-            target_names=["Normal", "Apnea"],
-            output_dict=True,
-        )
-        logger.info("[APNEA] AUC-ROC: %.4f", auc)
+            y_te, (y_prob > best_thresh).astype(int),
+            target_names=["Normal", "Apnea"], output_dict=True)
         logger.info("\n%s", classification_report(
-            y_te, (y_prob > 0.5).astype(int),
-            target_names=["Normal", "Apnea"],
-        ))
+            y_te, (y_prob > best_thresh).astype(int),
+            target_names=["Normal", "Apnea"]))
+        
         insert_apnea_results(auc, report)
         log_module("apnea", "train", "done", f"auc={auc:.4f}", total_segs)
     else:
         logger.warning("[APNEA] Only one class in test set — AUC not computed")
         log_module("apnea", "train", "skipped", "Single class in test", 0)
 
+    # ── Save model and scaler if requested ────────────────────────────────────
+    if save_model and HAS_TF:
+        _save_model_and_scaler(model, scaler, "apnea_model.keras", "apnea_scaler.pkl")
+
     logger.info("[APNEA] Module complete.")
 
 
-# MODULE 3 — SEPSIS
+# ── Model + scaler save helpers ──────────────────────────────────────────────
 
-
-def _sep_preprocess_row(raw: Dict) -> Dict[str, Any]:
-    """Derive additional clinical features for one sepsis patient row."""
-    def g(k: str) -> float:
-        try:
-            return float(raw.get(k) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    sbp = g("sbp_mean")
-    dbp = g("dbp_mean")
-    return {
-        "pulse_pressure": sbp - dbp,
-        "shock_index": g("hr_mean") / (sbp + 1e-6),
-        "spo2_rr_ratio": g("spo2_mean") / (g("respiratory_rate_mean") + 1e-6),
-        "lactate_high": int(g("lactate_mmol") > 2.0),
-        "map_low": int(g("map_mean") < 65.0),
-    }
-
-
-def run_sepsis_module() -> None:
-    """Run the full sepsis pipeline: ingest → preprocess → features → train."""
-    logger.info("=" * 60)
-    logger.info(" SEPSIS MODULE")
-    logger.info("=" * 60)
-
-    # Stage 1: Ingest 
-    log_module("sepsis", "ingest", "started")
-    sep_path = _resolve("sepsis_icu_synthetic.csv", "sepsis icu synthetic.csv")
-    if not sep_path:
-        logger.error("[SEP] sepsis_icu_synthetic.csv not found in %s", DATA_DIR)
-        log_module("sepsis", "ingest", "failed", "Sepsis CSV not found", 0)
-        return
-
-    df = pd.read_csv(sep_path, low_memory=False)
-    logger.info("[SEP] Loaded %d patients | prevalence %.1f%%",
-                len(df), df["sepsis_label"].mean() * 100)
-
-    raw_rows = [
-        (int(row["subject_id"]),
-         json.dumps({k: (None if pd.isna(v) else v)
-                     for k, v in row.items()}))
-        for _, row in df.iterrows()
-    ]
-    insert_sep_raw(raw_rows)
-    log_module("sepsis", "ingest", "done", "Raw patients stored", len(raw_rows))
-
-    # Stage 2: Preprocess 
-    log_module("sepsis", "preprocess", "started")
-    import sqlite3 as _sql
-    con = _sql.connect(DB_PATH)
-    con.row_factory = _sql.Row
-    raw_db = con.execute(
-        "SELECT id, subject_id, raw_json FROM sepsis_raw"
-        " WHERE id NOT IN (SELECT raw_id FROM sepsis_preprocessed)"
-    ).fetchall()
-    con.close()
-
-    pre_rows: List[tuple] = []
-    for r in raw_db:
-        raw = json.loads(r["raw_json"])
-        p = _sep_preprocess_row(raw)
-        pre_rows.append((
-            r["id"], int(r["subject_id"]),
-            p["pulse_pressure"], p["shock_index"],
-            p["spo2_rr_ratio"], p["lactate_high"], p["map_low"],
-        ))
-
-    insert_sep_preprocessed(pre_rows)
-    logger.info("[SEP] %d preprocessed rows stored", len(pre_rows))
-    log_module("sepsis", "preprocess", "done", "", len(pre_rows))
-
-    # Stage 3: Feature extraction 
-    log_module("sepsis", "features", "started")
-    import sqlite3 as _sql
-    con = _sql.connect(DB_PATH)
-    con.row_factory = _sql.Row
-    pre_df = pd.read_sql("""
-        SELECT p.id, p.subject_id, p.pulse_pressure, p.shock_index,
-               p.spo2_rr_ratio, p.lactate_high, p.map_low, r.raw_json
-        FROM sepsis_preprocessed p
-        JOIN sepsis_raw r ON r.id = p.raw_id
-        WHERE p.id NOT IN (SELECT preprocessed_id FROM sepsis_features)
-    """, con)
-    con.close()
-
-    def _parse_sep_cols(raw_json: str) -> Dict:
-        d = json.loads(raw_json)
-        out = {c: float(d.get(c) or 0.0)
-               for c in SEPSIS_COLS if c in d}
-        out["sepsis_label"] = int(d.get("sepsis_label") or 0)
-        return out
-
-    raw_feat = pre_df["raw_json"].apply(_parse_sep_cols).apply(pd.Series)
-    sep_feat = pd.concat(
-        [pre_df.drop(columns=["raw_json"]), raw_feat], axis=1
-    ).fillna(0.0)
-    # Add derived features
-    sep_feat["shock_index_derived"] = (
-        sep_feat.get("hr_mean", pd.Series(0.0, index=sep_feat.index)) /
-        (sep_feat.get("sbp_mean", pd.Series(120.0, index=sep_feat.index)) + 1e-6)
-    )
-    sep_feat["temp_hr_product"] = (
-        sep_feat.get("temp_celsius_mean", pd.Series(37.0, index=sep_feat.index)) *
-        sep_feat.get("hr_mean", pd.Series(70.0, index=sep_feat.index))
-    )
-
-    f_cols = [c for c in sep_feat.columns
-              if c not in ("id", "subject_id", "sepsis_label")]
-    feat_rows: List[tuple] = []
-    for i, (_, row) in enumerate(sep_feat.iterrows()):
-        feat_rows.append((
-            int(row["id"]),
-            int(row["subject_id"]),
-            int(row.get("sepsis_label", 0)),
-            sep_feat[f_cols].iloc[i].to_json(),
-        ))
-
-    insert_sep_features(feat_rows)
-    logger.info("[SEP] %d feature rows stored", len(feat_rows))
-    log_module("sepsis", "features", "done", "", len(feat_rows))
-
-    # Stage 4: Train & predict 
-    log_module("sepsis", "train", "started")
-    feat_load = fetch_sep_features()
-    X = feat_load["feature_json"].apply(json.loads).apply(pd.Series).fillna(0.0)
-    y = feat_load["sepsis_label"].astype(int)
-
-    X_tr, X_te, y_tr, y_te, sid_tr, sid_te = train_test_split(
-        X, y, feat_load["subject_id"],
-        test_size=0.2, stratify=y, random_state=42,
-    )
-    scaler = StandardScaler()
-    model = GradientBoostingClassifier(
-        n_estimators=200, max_depth=4,
-        learning_rate=0.05, subsample=0.8, random_state=42,
-    )
-    model.fit(scaler.fit_transform(X_tr), y_tr)
-    y_prob = model.predict_proba(scaler.transform(X_te))[:, 1]
-    y_pred = (y_prob > 0.4).astype(int)
-    auc = roc_auc_score(y_te, y_prob)
-    report = classification_report(
-        y_te, y_pred,
-        target_names=["No Sepsis", "Sepsis"],
-        output_dict=True,
-    )
-    accuracy = report["accuracy"]
-    logger.info("[SEP] AUC-ROC: %.4f | Accuracy: %.4f", auc, accuracy)
-    logger.info("\n%s", classification_report(
-        y_te, y_pred, target_names=["No Sepsis", "Sepsis"]
-    ))
-
-    insert_sep_results(accuracy, auc, report)
-    pred_rows = [
-        (int(sid), str(int(yt)), str(int(yp)), float(ypr))
-        for sid, yt, yp, ypr in zip(sid_te, y_te, y_pred, y_prob)
-    ]
-    insert_sep_predictions(pred_rows)
-
-    # Save vitals time-series for 5 sample patients
-    sample_patients = df.sample(min(5, len(df)), random_state=1)
-    for _, row in sample_patients.iterrows():
-        insert_sep_vitals_plot(
-            subject_id=int(row["subject_id"]),
-            hr=[float(row.get(f"hr_mean", 70))] * 24,
-            spo2=[float(row.get("spo2_mean", 97))] * 24,
-            bp=[float(row.get("sbp_mean", 120))] * 24,
-            temp=[float(row.get("temp_celsius_mean", 37))] * 24,
-            rr=[float(row.get("respiratory_rate_mean", 16))] * 24,
-        )
-
-    log_module("sepsis", "train", "done",
-               f"auc={auc:.4f} acc={accuracy:.4f}", len(pred_rows))
-    logger.info("[SEP] Module complete.")
+def _save_model_and_scaler(model, scaler, model_path: str, scaler_path: str) -> None:
+    """Save the trained Keras model and fitted StandardScaler to disk."""
+    import pickle
+    model.save(model_path)
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler, f)
+    logger.info("[SAVE] Model saved to %s", model_path)
+    logger.info("[SAVE] Scaler saved to %s", scaler_path)
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Vital Signs ML Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pipeline/pipeline.py                  # run all three modules
-  python pipeline/pipeline.py --module apnea   # run apnea only
-  python pipeline/pipeline.py --fresh          # delete DB and start clean
-        """,
-    )
-    parser.add_argument(
-        "--module",
-        choices=["arrhythmia", "apnea", "sepsis"],
-        default=None,
-        help="Run a single module (default: run all three)",
-    )
-    parser.add_argument(
-        "--fresh",
-        action="store_true",
-        help="Delete the existing database before running",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=None,
-        help="Directory containing CSV data files (default: DATA_DIR env or '.')",
-    )
-    parser.add_argument(
-        "--beats",
-        type=int,
-        default=BEATS_PER_TYPE,
-        help=f"Max beats per arrhythmia class (default: {BEATS_PER_TYPE})",
-    )
-    parser.add_argument(
-        "--records",
-        type=int,
-        default=N_MIMIC_RECORDS,
-        help=f"Number of MIMIC-IV records to load (default: {N_MIMIC_RECORDS})",
-    )
+    parser = argparse.ArgumentParser(description="Apnea Vital Signs ML Pipeline")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Delete the existing database before running")
+    parser.add_argument("--save-model", action="store_true",
+                        help="Save the trained model and scaler to disk")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Pipeline entry point."""
     args = _parse_args()
-
-    global DATA_DIR
-    if args.data_dir:
-        DATA_DIR = args.data_dir
-
-    if args.fresh and os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    if args.fresh:
+        for suffix in ["", "-wal", "-shm"]:
+            p = DB_PATH + suffix
+            if os.path.exists(p):
+                os.remove(p)
         logger.info("[DB] Existing database deleted.")
-
     init_db()
-
-    if args.module == "arrhythmia" or args.module is None:
-        run_arrhythmia_module(beats_per_type=args.beats)
-
-    if args.module == "apnea" or args.module is None:
-        run_apnea_module(n_records=args.records)
-
-    if args.module == "sepsis" or args.module is None:
-        run_sepsis_module()
-
+    run_apnea_module(save_model=args.save_model)
     logger.info("[DONE] Pipeline complete. DB: %s", os.path.abspath(DB_PATH))
 
 

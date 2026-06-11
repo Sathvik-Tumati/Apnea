@@ -1,17 +1,13 @@
 export default function OverviewTab({ summary, loading }) {
   const cards = [
-    { label: 'Arrhythmia Beats',       value: summary?.arrhythmia_beats,       color: 'cyan',   icon: '♡' },
-    { label: 'Arrhythmia Predictions', value: summary?.arrhythmia_predictions, color: 'green',  icon: '△' },
-    { label: 'Apnea Segments',         value: summary?.apnea_segments,         color: 'amber',  icon: '◎' },
-    { label: 'Sepsis Patients',        value: summary?.sepsis_patients,        color: 'red',    icon: '⚕' },
-    { label: 'Sepsis Predictions',     value: summary?.sepsis_predictions,     color: 'purple', icon: '◇' },
-    { label: 'Pipeline Stages',        value: summary?.pipeline_stages_run,    color: 'cyan',   icon: '▤' },
+    { label: 'Apnea Segments', value: summary?.apnea_segments, color: 'amber', icon: '◎' },
+    { label: 'Pipeline Stages', value: summary?.pipeline_stages_run, color: 'cyan', icon: '▤' },
   ];
 
   return (
     <div className="space-y-5">
       {/* Stat cards grid */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 gap-3">
         {cards.map((c, i) => (
           <div
             key={c.label}
@@ -47,28 +43,14 @@ export default function OverviewTab({ summary, loading }) {
       </div>
 
       {/* Module status cards */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 gap-4">
         {[
           {
-            title: 'Arrhythmia Module',
-            desc: 'Beat-level ECG classification: N, VEB, SVEB, F, Q',
-            color: 'var(--color-cyan)',
-            dataSource: 'MIT-BIH / INCART / SCD-Holter CSVs',
-            model: 'RandomForestClassifier',
-          },
-          {
             title: 'Apnea Module',
-            desc: 'Sleep apnea detection with AASM multi-signal scoring',
+            desc: 'Sleep apnea detection with 3-signal composite scoring',
             color: 'var(--color-amber)',
             dataSource: 'MIMIC-IV Waveform (PhysioNet)',
             model: 'Bidirectional LSTM',
-          },
-          {
-            title: 'Sepsis Module',
-            desc: 'ICU sepsis early warning from clinical vitals',
-            color: 'var(--color-red)',
-            dataSource: 'sepsis_icu_synthetic.csv',
-            model: 'GradientBoostingClassifier',
           },
         ].map((mod, i) => (
           <div

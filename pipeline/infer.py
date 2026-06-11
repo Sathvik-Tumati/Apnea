@@ -1,0 +1,787 @@
+"""
+infer.py
+========
+Unified apnea inference — handles both 125 Hz and 250 Hz ECG CSV files
+automatically. No separate scripts needed.
+
+Detection
+---------
+Reads the first 3 rows of the CSV, counts ecgData[] columns:
+  3750 columns → 125 Hz  (30 s × 125 = 3750 samples per row)
+  7500 columns → 250 Hz  (30 s × 250 = 7500 samples per row)
+A spectral sanity check runs alongside the column count to catch
+mislabelled files. Override with --force-hz if needed.
+
+250 Hz path
+-----------
+Dual-path downsampling to 125 Hz:
+  Path A : Cubic spline interpolation (smooth, shape-preserving)
+  Path B : Polyphase FIR decimation   (anti-aliasing, noise-robust)
+  Fused  : Element-wise mean of A and B
+All downstream processing (R-peaks, HRV, EDR, features) runs at 125 Hz.
+
+Workflow
+--------
+1. Train on MIMIC and save model + scaler:
+       python pipeline/pipeline.py --fresh --save-model
+
+2. Run inference:
+       python infer.py --csv /path/to/ecg_analysis.arrhythmia_results.csv
+
+Output (in infer_output/)
+--------------------------
+  infer_results_<admissionId>.csv   per-segment features + predictions
+  infer_summary.csv                 one row per patient — AHI proxy + severity
+  infer_summary.txt                 human-readable report
+
+Usage
+-----
+python infer.py --csv /path/to/file.csv
+python infer.py --csv /path/to/file.csv --force-hz 250
+python infer.py --csv /path/to/file.csv --admission ADM914251465 --threshold 0.40
+"""
+
+import argparse
+import logging
+import os
+import pickle
+import warnings
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import CubicSpline
+from scipy.signal import butter, filtfilt, find_peaks, resample_poly, welch
+from scipy.signal.windows import tukey
+
+warnings.filterwarnings("ignore")
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+# ── neurokit2 (checked once at import, not per segment) ──────────────────────
+try:
+    import neurokit2 as nk
+    HAS_NK = True
+    logger.info("neurokit2 available — using for R-peak detection")
+except Exception:
+    HAS_NK = False
+    logger.warning("neurokit2 not available — using scipy R-peak fallback")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+FS_ECG        = 125     # all processing runs at this rate
+FS_RESP       = 4
+SEGMENT_LEN_S = 30
+SAMPLES_125   = 3750    # 30 s × 125 Hz
+SAMPLES_250   = 7500    # 30 s × 250 Hz
+TIMESTEPS     = 10
+HR_TOLERANCE  = 15.0    # bpm — gap between sub-seg instantaneous HR and 30s mean
+
+# Known sample counts → Hz
+KNOWN_SAMPLE_COUNTS = {3750: 125, 7500: 250}
+
+# Column name lists
+ECG_COLS_125   = [f"ecgData[{i}]" for i in range(SAMPLES_125)]
+ECG_COLS_250   = [f"ecgData[{i}]" for i in range(SAMPLES_250)]
+HR_SUBSEG_COLS = [f"analysis.segments[{i}].morphology.hr_bpm" for i in range(6)]
+SIG_QUAL_COL   = "analysis.summary.signal_quality"
+RHYTHM_COLS    = [f"analysis.segments[{i}].rhythm_label"  for i in range(6)]
+ECTOPY_COLS    = [f"analysis.segments[{i}].ectopy_label"  for i in range(6)]
+
+APNEA_FEATURE_COLS = [
+    "rr_mean", "rr_std", "rmssd", "pnn50", "mean_hr", "hr_range", "lf_hf_ratio",
+    "resp_rate_bpm", "resp_rate_variability", "flatline_duration_s",
+    "resp_amplitude_mean", "resp_amplitude_std",
+    "spo2_mean", "spo2_min", "spo2_delta_index", "odi", "t90", "spo2_approx_entropy",
+    "map_mean", "map_std", "map_variability", "sbp_max", "dbp_min", "pulse_pressure",
+    "resp_spo2_lag_s", "ptt_ms", "ecg_resp_coherence",
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SAMPLING RATE DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _detect_sampling_rate(csv_path: str) -> Tuple[int, str]:
+    """
+    Auto-detect ECG sampling rate from a CSV file.
+
+    Returns (hz, evidence_string).
+    Raises ValueError if no ecgData[] columns are found.
+    """
+    logger.info("[DETECT] Reading header + 3 rows from %s ...", csv_path)
+    df_head = pd.read_csv(csv_path, nrows=3, low_memory=False)
+
+    ecg_cols = sorted(
+        [c for c in df_head.columns if c.startswith("ecgData[")],
+        key=lambda c: int(c.split("[")[1].rstrip("]")),
+    )
+    n_cols = len(ecg_cols)
+
+    logger.info("[DETECT] Found %d ecgData[] columns (first=%s  last=%s)",
+                n_cols,
+                ecg_cols[0]  if ecg_cols else "none",
+                ecg_cols[-1] if ecg_cols else "none")
+
+    if n_cols == 0:
+        raise ValueError(
+            "No ecgData[] columns found. "
+            "Check that this is an arrhythmia results CSV with ecgData[N] columns."
+        )
+
+    hz = KNOWN_SAMPLE_COUNTS.get(n_cols)
+
+    if hz is None:
+        # Unknown count — pick by proximity to 30-second segment at each candidate
+        d125 = abs(n_cols / 125.0 - 30.0)
+        d250 = abs(n_cols / 250.0 - 30.0)
+        hz   = 125 if d125 <= d250 else 250
+        logger.warning(
+            "[DETECT] Non-standard column count %d — best guess: %d Hz "
+            "(override with --force-hz if wrong)", n_cols, hz)
+
+    # Spectral sanity check — warns only, does not override column count
+    ecg_sample = df_head[ecg_cols].iloc[0].values.astype(float)
+    ecg_sample[np.isnan(ecg_sample)] = 0.0
+    if len(ecg_sample) >= 256:
+        f, pxx = welch(ecg_sample, fs=hz,
+                       nperseg=min(512, len(ecg_sample) // 4), nfft=1024)
+        total  = float(np.sum(pxx)) or 1.0
+        hf_frac = float(np.sum(pxx[f > 62.5])) / total
+        if hz == 125 and hf_frac > 0.05:
+            logger.warning(
+                "[DETECT] Column count says 125 Hz but %.1f%% of spectral power "
+                "is above 62.5 Hz. File may actually be 250 Hz. "
+                "Use --force-hz 250 to override.", hf_frac * 100)
+        else:
+            logger.info("[DETECT] Spectral check: %.1f%% power above 62.5 Hz — "
+                        "consistent with %d Hz.", hf_frac * 100, hz)
+
+    evidence = (f"{n_cols} ecgData[] columns = {n_cols // hz}s × {hz} Hz "
+                f"per segment")
+    logger.info("[DETECT] ─────────────────────────────────────────")
+    logger.info("[DETECT]  Detected : %d Hz", hz)
+    logger.info("[DETECT]  Evidence : %s", evidence)
+    logger.info("[DETECT] ─────────────────────────────────────────")
+    return hz, evidence
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIGNAL PROCESSING  (shared by both Hz paths)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _bandpass(sig: np.ndarray, fs: int,
+              lo: float = 0.5, hi: float = 40.0, order: int = 3) -> np.ndarray:
+    nyq = fs / 2.0
+    hi  = min(hi, nyq - 0.1)
+    lo  = min(lo, hi - 0.1)
+    b, a = butter(order, [lo / nyq, hi / nyq], btype="band")
+    return filtfilt(b, a, sig)
+
+
+def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
+    """neurokit2 preferred; robust scipy fallback."""
+    if HAS_NK:
+        try:
+            _, info = nk.ecg_process(ecg, sampling_rate=fs)
+            peaks   = np.array(info["ECG_R_Peaks"], dtype=int)
+            if len(peaks) >= 2:
+                hr = 60.0 / (np.mean(np.diff(peaks)) / fs + 1e-9)
+                if 30 <= hr <= 200:
+                    return peaks
+                logger.debug("nk peaks imply %.0f BPM — falling back to scipy", hr)
+        except Exception as exc:
+            logger.debug("nk.ecg_process: %s — scipy fallback", exc)
+
+    min_dist = int(fs * 0.4)
+    thr      = float(np.mean(ecg) + 0.15 * np.std(ecg))
+    peaks, _ = find_peaks(ecg, distance=min_dist, height=thr)
+    if len(peaks) < 5:
+        thr      = float(np.percentile(ecg, 60))
+        peaks, _ = find_peaks(ecg, distance=min_dist, height=thr)
+    return peaks
+
+
+def _downsample_250_to_125(ecg_250: np.ndarray) -> np.ndarray:
+    """
+    Dual-path 250 Hz → 125 Hz downsampling.
+      Path A : Cubic spline interpolation (shape-preserving)
+      Path B : Polyphase FIR decimation   (anti-aliasing)
+      Fused  : Element-wise mean
+    """
+    t_raw    = np.arange(len(ecg_250)) / 250.0
+    t_target = np.arange(SAMPLES_125)  / 125.0
+
+    # Path A — cubic spline
+    try:
+        path_a = CubicSpline(t_raw, ecg_250, bc_type="not-a-knot")(t_target)
+    except Exception:
+        path_a = np.interp(t_target, t_raw, ecg_250)
+
+    # Path B — polyphase FIR
+    path_b = resample_poly(ecg_250, up=1, down=2).astype(float)
+
+    min_len = min(len(path_a), len(path_b), SAMPLES_125)
+    fused   = 0.5 * (path_a[:min_len] + path_b[:min_len])
+
+    if len(fused) < SAMPLES_125:
+        fused = np.pad(fused, (0, SAMPLES_125 - len(fused)), mode="edge")
+    return fused[:SAMPLES_125]
+
+
+def _get_ecg(row: pd.Series, hz: int) -> np.ndarray:
+    """
+    Extract ECG from a CSV row, normalise to 125 Hz, bandpass filter.
+    Handles both 125 Hz (no resampling) and 250 Hz (dual-path downsample).
+    """
+    cols = ECG_COLS_250 if hz == 250 else ECG_COLS_125
+    ecg  = row[cols].values.astype(float)
+    if np.isnan(ecg).any():
+        ecg = pd.Series(ecg).ffill().bfill().fillna(0.0).values
+    if hz == 250:
+        ecg = _downsample_250_to_125(ecg)
+    return _bandpass(ecg, FS_ECG)
+
+
+def _compute_edr(ecg: np.ndarray, r_peaks: np.ndarray,
+                 fs_ecg: int = FS_ECG, fs_resp: int = FS_RESP) -> np.ndarray:
+    """Dual-engine QRS-area + QRS-PCA waveform fusion EDR."""
+    if len(r_peaks) < 8:
+        return np.zeros(int(len(ecg) * fs_resp / fs_ecg))
+    t_peaks   = r_peaks / fs_ecg
+    t_uniform = np.arange(0, len(ecg) / fs_ecg, 1.0 / fs_resp)
+
+    def _env(raw_v, times):
+        if len(raw_v) < 6:
+            return np.zeros_like(t_uniform)
+        v = raw_v - np.polyval(np.polyfit(times, raw_v, 1), times)
+        s = np.interp(t_uniform, times, v)
+        return (s - np.mean(s)) / (np.std(s) + 1e-9)
+
+    qrs_win = max(1, int(0.06 * fs_ecg))
+    areas   = [np.sum(np.abs(ecg[max(0, r - qrs_win):min(len(ecg), r + qrs_win)]))
+               for r in r_peaks]
+    m3 = _env(np.array(areas, dtype=float), t_peaks)
+    beats = [ecg[r - qrs_win:r + qrs_win]
+             for r in r_peaks if r - qrs_win >= 0 and r + qrs_win <= len(ecg)]
+    m4 = m3
+    if len(beats) >= 8:
+        X = np.array(beats, dtype=float)
+        X -= X.mean(axis=0, keepdims=True)
+        try:
+            U, S, _ = np.linalg.svd(X, full_matrices=False)
+            m4 = _env(U[:, 0] * S[0], t_peaks[:len(beats)])
+        except np.linalg.LinAlgError:
+            pass
+    n = min(len(m3), len(m4))
+    fused = np.median(np.vstack([m3[:n], m4[:n]]), axis=0)
+    nyq = fs_resp / 2.0
+    b, a = butter(3, [0.1 / nyq, 0.5 / nyq], btype="band")
+    out = np.zeros_like(t_uniform)
+    out[:n] = filtfilt(b, a, fused)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FEATURE EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_features(
+    ecg: np.ndarray,
+    baseline: Dict[str, float],
+) -> Tuple[Dict[str, float], np.ndarray, float]:
+    """
+    Extract APNEA_FEATURE_COLS from a 30-second ECG at 125 Hz.
+    Returns (feats, r_peaks, ecg_hr_bpm).
+    """
+    feats: Dict[str, float] = {}
+    r_peaks = _detect_r_peaks(ecg, FS_ECG)
+
+    # HRV
+    if len(r_peaks) >= 3:
+        rr_ms    = np.diff(r_peaks) / FS_ECG * 1000.0
+        rr_diffs = np.diff(rr_ms)
+        feats["rr_mean"]     = float(np.mean(rr_ms))
+        feats["rr_std"]      = float(np.std(rr_ms))
+        feats["rmssd"]       = float(np.sqrt(np.mean(rr_diffs ** 2)))
+        feats["pnn50"]       = float(np.sum(np.abs(rr_diffs) > 50) / max(len(rr_ms), 1))
+        feats["mean_hr"]     = float(60000.0 / (np.mean(rr_ms) + 1e-6))
+        feats["hr_range"]    = float(
+            60000.0 / (np.min(rr_ms) + 1e-6) - 60000.0 / (np.max(rr_ms) + 1e-6))
+        feats["lf_hf_ratio"] = 0.0
+        ecg_hr = feats["mean_hr"]
+    else:
+        for k in ("rr_mean", "rr_std", "rmssd", "pnn50",
+                  "mean_hr", "hr_range", "lf_hf_ratio"):
+            feats[k] = 0.0
+        ecg_hr = 0.0
+
+    # EDR
+    resp = _compute_edr(ecg, r_peaks)
+    feats["resp_amplitude_mean"] = float(np.mean(np.abs(resp)))
+    feats["resp_amplitude_std"]  = float(np.std(resp))
+    threshold  = np.mean(resp) - 1.5 * np.std(resp)
+    suppressed = resp < threshold
+    max_run = cur = 0
+    for v in suppressed:
+        if v:
+            cur += 1; max_run = max(max_run, cur)
+        else:
+            cur = 0
+    feats["flatline_duration_s"] = float(max_run / FS_RESP)
+
+    try:
+        w       = tukey(len(resp), alpha=0.1)
+        nperseg = min(len(resp), max(8, int(FS_RESP * 60)))
+        f, pxx  = welch(resp * w, fs=FS_RESP, nperseg=nperseg,
+                        noverlap=nperseg // 2, nfft=2048)
+        inn     = (f >= 0.1) & (f <= 0.6)
+        feats["resp_rate_bpm"] = (float(f[inn][np.argmax(pxx[inn])] * 60.0)
+                                  if np.any(inn) else 0.0)
+        rp2, _ = find_peaks(resp, distance=int(FS_RESP * 1.5))
+        feats["resp_rate_variability"] = (float(np.std(np.diff(rp2) / FS_RESP))
+                                          if len(rp2) >= 2 else 0.0)
+    except Exception:
+        feats["resp_rate_bpm"] = feats["resp_rate_variability"] = 0.0
+
+    # SpO2, ABP, cross-signal — not available at inference time
+    feats.update({
+        "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
+        "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
+        "map_mean": 0.0, "map_std": 0.0, "map_variability": 0.0,
+        "sbp_max": 0.0, "dbp_min": 0.0, "pulse_pressure": 0.0,
+        "resp_spo2_lag_s": 0.0, "ptt_ms": 0.0, "ecg_resp_coherence": 0.0,
+    })
+    return feats, r_peaks, ecg_hr
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BASELINE COMPUTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_baseline(df: pd.DataFrame, hz: int) -> Dict[str, float]:
+    """Estimate per-patient baseline from the first quiet segments."""
+    hr_vals, rmssd_vals, rr_vals = [], [], []
+    for _, row in df.head(10).iterrows():
+        sub_hrs = [row.get(c, np.nan) for c in HR_SUBSEG_COLS]
+        valid   = [v for v in sub_hrs if pd.notna(v)]
+        if valid:
+            hr_vals.append(float(np.mean(valid)))
+            rr_vals.append(60000.0 / (np.mean(valid) + 1e-6))
+        ecg = _get_ecg(row, hz)
+        rp  = _detect_r_peaks(ecg, FS_ECG)
+        if len(rp) >= 3:
+            rr = np.diff(rp) / FS_ECG * 1000.0
+            if len(rr) >= 2:
+                rmssd_vals.append(float(np.sqrt(np.mean(np.diff(rr) ** 2))))
+    return {
+        "baseline_spo2":    97.0,
+        "baseline_rmssd":   float(np.mean(rmssd_vals)) if rmssd_vals else 35.0,
+        "baseline_rr_ms":   float(np.mean(rr_vals))    if rr_vals    else 833.0,
+        "baseline_map_std": 5.0,
+        "baseline_sbp":     120.0,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PER-ADMISSION INFERENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_sequences(X: np.ndarray, t: int) -> np.ndarray:
+    if len(X) <= t:
+        return np.empty((0, t, X.shape[1]))
+    return np.array([X[i:i + t] for i in range(len(X) - t)])
+
+
+def _run_one_admission(
+    adm_id:    str,
+    adm_df:    pd.DataFrame,
+    model,
+    scaler,
+    threshold: float,
+    out_dir:   str,
+    hz:        int,
+) -> Dict:
+    """Full inference pipeline for one admission."""
+    n = len(adm_df)
+    ds_note = "" if hz == 125 else "  (250→125 Hz dual-path downsample)"
+    logger.info("[%s] %d segments  (%.1f min)%s",
+                adm_id, n, n * SEGMENT_LEN_S / 60.0, ds_note)
+
+    baseline = _compute_baseline(adm_df, hz)
+    logger.info("[%s] Baseline: rmssd=%.1f  rr_ms=%.1f",
+                adm_id, baseline["baseline_rmssd"], baseline["baseline_rr_ms"])
+
+    rows_out   = []
+    n_flag_hr  = 0
+    n_flag_q   = 0
+
+    for seg_i, (_, row) in enumerate(adm_df.iterrows()):
+
+        # ECG extraction + normalisation to 125 Hz
+        ecg = _get_ecg(row, hz)
+
+        # Reference HR from upstream analysis
+        sub_hrs       = [row.get(c, np.nan) for c in HR_SUBSEG_COLS]
+        sub_hrs_valid = [v for v in sub_hrs if pd.notna(v)]
+        ref_hr  = float(np.mean(sub_hrs_valid)) if sub_hrs_valid else np.nan
+        ref_std = float(np.std(sub_hrs_valid))  if len(sub_hrs_valid) > 1 else 0.0
+
+        # Signal quality
+        sig_qual = str(row.get(SIG_QUAL_COL, "unknown")).lower()
+        qual_ok  = sig_qual in ("acceptable", "good", "excellent")
+
+        # Features
+        feats, r_peaks, ecg_hr = _extract_features(ecg, baseline)
+
+        # HR validation gate
+        if pd.notna(ref_hr) and ecg_hr > 0:
+            hr_diff  = abs(ecg_hr - ref_hr)
+            hr_ok    = hr_diff <= HR_TOLERANCE
+        else:
+            hr_diff  = np.nan
+            hr_ok    = True
+
+        if not qual_ok:
+            quality_flag = f"LOW_QUALITY_SIGNAL_{sig_qual.upper()}"
+            n_flag_q += 1
+        elif not hr_ok:
+            quality_flag = "LOW_QUALITY_HR_MISMATCH"
+            n_flag_hr += 1
+            logger.warning(
+                "[HR-GATE] %s seg=%d  ECG=%.1f bpm  ref=%.1f bpm  "
+                "diff=%.1f > %.0f bpm  src=%dHz → FLAGGED",
+                adm_id, seg_i, ecg_hr, ref_hr, hr_diff, HR_TOLERANCE, hz)
+        else:
+            quality_flag = "OK"
+
+        # Metadata
+        rhythm_labels = [str(row.get(c, "")) for c in RHYTHM_COLS]
+        ectopy_labels = [str(row.get(c, "")) for c in ECTOPY_COLS]
+        feats.update({
+            "segment_idx":    seg_i,
+            "start_time_s":   seg_i * SEGMENT_LEN_S,
+            "timestamp":      row.get("timestamp", ""),
+            "fs_source_hz":   hz,
+            "ecg_hr_bpm":     round(ecg_hr, 2),
+            "ref_hr_bpm":     round(ref_hr, 2) if pd.notna(ref_hr) else np.nan,
+            "ref_hr_std":     round(ref_std, 2),
+            "hr_diff_bpm":    round(hr_diff, 2) if pd.notna(hr_diff) else np.nan,
+            "hr_gate_pass":   int(hr_ok),
+            "signal_quality": sig_qual,
+            "quality_flag":   quality_flag,
+            "dominant_rhythm": max(set(rhythm_labels), key=rhythm_labels.count),
+            "ectopy_present":  int(any(
+                v not in ("", "nan", "None") for v in ectopy_labels)),
+            "overall_hr_bpm":  row.get("analysis.heart_rate_bpm", np.nan),
+        })
+        rows_out.append(feats)
+
+        if (seg_i + 1) % 100 == 0 or seg_i == n - 1:
+            logger.info("[%s] Features: %d / %d  "
+                        "(hr_flagged=%d  qual_flagged=%d)",
+                        adm_id, seg_i + 1, n, n_flag_hr, n_flag_q)
+
+    feat_df = pd.DataFrame(rows_out)
+    total_flagged = n_flag_hr + n_flag_q
+    gate_pct      = 100.0 * total_flagged / max(n, 1)
+    logger.info("[%s] Quality gate: %d / %d flagged (%.1f%%)",
+                adm_id, total_flagged, n, gate_pct)
+    if gate_pct > 20:
+        logger.warning(
+            "[%s] %.0f%% of segments flagged — check R-peak detection quality.",
+            adm_id, gate_pct)
+
+    # Ensure all feature columns exist
+    for c in APNEA_FEATURE_COLS:
+        if c not in feat_df.columns:
+            feat_df[c] = 0.0
+
+    # Model inference
+    is_flagged = (feat_df["quality_flag"] != "OK").values
+    X_scaled   = scaler.transform(
+        feat_df[APNEA_FEATURE_COLS].fillna(0.0).values.astype(float))
+    X_seq      = _build_sequences(X_scaled, TIMESTEPS)
+
+    prob_col = np.full(n, np.nan)
+    pred_col = np.full(n, np.nan)
+
+    if len(X_seq) > 0:
+        logger.info("[%s] Running model on %d sequences ...", adm_id, len(X_seq))
+        y_prob = model.predict(X_seq, verbose=0, batch_size=64).flatten()
+        for j, yp in enumerate(y_prob):
+            si = j + TIMESTEPS
+            if si >= n:
+                continue
+            if is_flagged[max(0, si - TIMESTEPS):si + 1].any():
+                continue
+            prob_col[si] = yp
+            pred_col[si] = int(yp > threshold)
+    else:
+        logger.warning(
+            "[%s] Only %d segments — LSTM needs ≥%d for any predictions "
+            "(%.1f min minimum recording needed).",
+            adm_id, n, TIMESTEPS + 1,
+            (TIMESTEPS + 1) * SEGMENT_LEN_S / 60.0)
+
+    feat_df["apnea_prob"]  = prob_col
+    feat_df["apnea_pred"]  = pred_col
+    feat_df["apnea_label"] = feat_df.apply(
+        lambda r: ("APNEA"    if r["apnea_pred"] == 1.0
+                   else "normal" if r["apnea_pred"] == 0.0
+                   else r["quality_flag"]),
+        axis=1)
+    feat_df["admission_id"] = adm_id
+
+    out_csv = os.path.join(out_dir, f"infer_results_{adm_id}.csv")
+    feat_df.to_csv(out_csv, index=False)
+    logger.info("[%s] Saved → %s", adm_id, out_csv)
+
+    # Summary stats
+    scored    = feat_df["apnea_pred"].notna()
+    n_scored  = int(scored.sum())
+    n_apnea   = int(feat_df.loc[scored, "apnea_pred"].sum())
+    apnea_pct = 100.0 * n_apnea / max(n_scored, 1)
+    dur_min   = n * SEGMENT_LEN_S / 60.0
+    ahi_proxy = n_apnea / max(dur_min / 60.0, 1e-6)
+    mean_prob = float(np.nanmean(prob_col))
+    severity  = ("Normal"       if ahi_proxy < 5  else
+                 "Mild OSA"     if ahi_proxy < 15 else
+                 "Moderate OSA" if ahi_proxy < 30 else
+                 "Severe OSA")
+    hr_diffs  = feat_df["hr_diff_bpm"].dropna()
+
+    apnea_rows = feat_df[feat_df["apnea_pred"] == 1.0].head(5)
+    if len(apnea_rows):
+        logger.info("[%s] First apnea detections:", adm_id)
+        for _, r in apnea_rows.iterrows():
+            logger.info(
+                "  seg=%3d  t=%s  prob=%.3f  ecg_hr=%.1f  ref_hr=%.1f  "
+                "resp=%.1f bpm  rhythm=%s  src=%dHz",
+                int(r["segment_idx"]), r.get("timestamp", ""),
+                r["apnea_prob"], r.get("ecg_hr_bpm", 0.0),
+                r.get("ref_hr_bpm", float("nan")),
+                r.get("resp_rate_bpm", 0.0),
+                r.get("dominant_rhythm", ""),
+                int(r.get("fs_source_hz", hz)))
+    else:
+        logger.info("[%s] No apnea detected above threshold %.2f", adm_id, threshold)
+
+    return {
+        "admission_id":     adm_id,
+        "fs_source_hz":     hz,
+        "total_segments":   n,
+        "flagged_segments": total_flagged,
+        "flagged_hr":       n_flag_hr,
+        "flagged_quality":  n_flag_q,
+        "scored_segments":  n_scored,
+        "n_apnea":          n_apnea,
+        "n_normal":         n_scored - n_apnea,
+        "apnea_pct":        round(apnea_pct, 1),
+        "mean_apnea_prob":  round(mean_prob, 3),
+        "ahi_proxy":        round(ahi_proxy, 1),
+        "severity":         severity,
+        "duration_min":     round(dur_min, 1),
+        "threshold":        threshold,
+        "mean_hr_diff_bpm": round(float(hr_diffs.mean()), 2) if len(hr_diffs) else 0.0,
+        "max_hr_diff_bpm":  round(float(hr_diffs.max()),  2) if len(hr_diffs) else 0.0,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_inference(
+    csv_path:     str,
+    model_path:   str,
+    scaler_path:  str,
+    threshold:    float,
+    out_dir:      str,
+    admission_id: Optional[str],
+    force_hz:     Optional[int] = None,
+    chunk_rows:   int = 500,
+) -> None:
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ── Detect sampling rate ──────────────────────────────────────────────────
+    if force_hz is not None:
+        hz       = force_hz
+        evidence = f"Forced by --force-hz {force_hz}"
+        logger.info("[DETECT] Sampling rate forced to %d Hz", hz)
+    else:
+        try:
+            hz, evidence = _detect_sampling_rate(csv_path)
+        except Exception as exc:
+            logger.error("[DETECT] %s", exc)
+            logger.error("Use --force-hz 125 or --force-hz 250 to skip detection.")
+            return
+
+    # ── Load model + scaler ───────────────────────────────────────────────────
+    for path, label in [(model_path, "Model"), (scaler_path, "Scaler")]:
+        if not os.path.exists(path):
+            logger.error("%s not found: '%s' — run pipeline.py --save-model",
+                         label, path)
+            return
+
+    logger.info("Loading model from %s", model_path)
+    try:
+        import tensorflow as tf
+        model = tf.keras.models.load_model(model_path, compile=False)
+    except Exception as exc:
+        logger.error("Failed to load model: %s", exc)
+        return
+
+    with open(scaler_path, "rb") as f:
+        scaler = pickle.load(f)
+
+    # ── Stream CSV ────────────────────────────────────────────────────────────
+    # Load the superset of ECG columns so that both 125 Hz and 250 Hz rows
+    # can be handled even if hz is ambiguous at load time.
+    ecg_cols_to_load = ECG_COLS_250 if hz == 250 else ECG_COLS_125
+    needed_cols = (
+        ["admissionId", "timestamp", SIG_QUAL_COL,
+         "analysis.heart_rate_bpm", "analysis.background_rhythm"]
+        + HR_SUBSEG_COLS + RHYTHM_COLS + ECTOPY_COLS + ecg_cols_to_load
+    )
+
+    logger.info("[LOAD] Streaming %s (%d Hz, %d ECG cols/row) ...",
+                csv_path, hz, len(ecg_cols_to_load))
+    admission_chunks: Dict[str, List[pd.DataFrame]] = {}
+    total_rows = 0
+
+    for chunk in pd.read_csv(csv_path,
+                              usecols=lambda c: c in needed_cols,
+                              chunksize=chunk_rows, low_memory=False):
+        total_rows += len(chunk)
+        if admission_id:
+            chunk = chunk[chunk["admissionId"] == admission_id]
+            if chunk.empty:
+                continue
+        for adm, grp in chunk.groupby("admissionId"):
+            admission_chunks.setdefault(adm, []).append(grp)
+        if total_rows % 5000 < chunk_rows:
+            logger.info("[LOAD] Streamed %d rows ...", total_rows)
+
+    logger.info("[LOAD] Total rows: %d  |  Admissions: %d",
+                total_rows, len(admission_chunks))
+
+    if not admission_chunks:
+        if admission_id:
+            logger.error("admissionId '%s' not found in CSV.", admission_id)
+        else:
+            logger.error("No data loaded.")
+        return
+
+    # ── Run per-admission inference ───────────────────────────────────────────
+    all_summaries = []
+    for adm_id, chunks in admission_chunks.items():
+        adm_df = pd.concat(chunks, ignore_index=True)
+        try:
+            adm_df = adm_df.sort_values("timestamp").reset_index(drop=True)
+        except Exception:
+            pass
+
+        logger.info("=" * 55)
+        logger.info("  Admission: %s  (%d segments)", adm_id, len(adm_df))
+        logger.info("=" * 55)
+
+        summary = _run_one_admission(
+            adm_id, adm_df, model, scaler, threshold, out_dir, hz)
+        if summary:
+            all_summaries.append(summary)
+
+    # ── Write summary files ───────────────────────────────────────────────────
+    if all_summaries:
+        ds_note = ("250→125 Hz dual-path downsample (cubic spline + polyphase FIR)"
+                   if hz == 250 else "125 Hz native")
+        lines = [
+            "=" * 60,
+            "  APNEA INFERENCE SUMMARY",
+            "=" * 60,
+            f"  Source     : {csv_path}",
+            f"  Threshold  : {threshold}",
+            f"  HR gate    : ±{HR_TOLERANCE} bpm",
+            f"  ECG input  : {hz} Hz  ({ds_note})",
+            "",
+        ]
+        for s in all_summaries:
+            lines += [
+                f"  ── {s['admission_id']} " + "─" * max(0, 38 - len(s['admission_id'])),
+                f"  Duration          : {s['duration_min']} min",
+                f"  Total segments    : {s['total_segments']}",
+                f"  Flagged (skipped) : {s['flagged_segments']}"
+                f"  ({s['flagged_hr']} HR mismatch, {s['flagged_quality']} poor signal)",
+                f"  Scored by model   : {s['scored_segments']}",
+                f"  Apnea detected    : {s['n_apnea']}  ({s['apnea_pct']}%)",
+                f"  Mean apnea prob   : {s['mean_apnea_prob']}",
+                f"  AHI proxy         : {s['ahi_proxy']} /hr  → {s['severity']}",
+                f"  Mean HR diff      : {s['mean_hr_diff_bpm']} bpm",
+                f"  Max HR diff       : {s['max_hr_diff_bpm']} bpm",
+                "",
+            ]
+        lines += [
+            "  AHI: <5 Normal | 5-15 Mild | 15-30 Moderate | >30 Severe",
+            "  NOTE: Research prototype. Not for clinical use.",
+            "=" * 60,
+        ]
+        summary_text = "\n".join(lines)
+        logger.info("\n%s", summary_text)
+
+        txt_path = os.path.join(out_dir, "infer_summary.txt")
+        with open(txt_path, "w") as f:
+            f.write(summary_text + "\n")
+
+        csv_sum = os.path.join(out_dir, "infer_summary.csv")
+        pd.DataFrame(all_summaries).to_csv(csv_sum, index=False)
+        logger.info("Summary → %s  |  %s", txt_path, csv_sum)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Apnea inference — auto-detects 125 Hz or 250 Hz ECG CSV",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples
+--------
+  python infer.py --csv /path/to/file.csv
+  python infer.py --csv /path/to/file.csv --force-hz 250
+  python infer.py --csv /path/to/file.csv --admission ADM914251465
+  python infer.py --csv /path/to/file.csv --threshold 0.40 --out-dir results/
+        """,
+    )
+    p.add_argument("--csv",       required=True)
+    p.add_argument("--model",     default="apnea_model.keras")
+    p.add_argument("--scaler",    default="apnea_scaler.pkl")
+    p.add_argument("--threshold", type=float, default=0.45)
+    p.add_argument("--out-dir",   default="infer_output")
+    p.add_argument("--admission", default=None,
+                   help="Process only this admissionId (default: all)")
+    p.add_argument("--force-hz",  type=int, choices=[125, 250], default=None,
+                   help="Override auto-detection: force 125 or 250 Hz")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    run_inference(
+        csv_path     = args.csv,
+        model_path   = args.model,
+        scaler_path  = args.scaler,
+        threshold    = args.threshold,
+        out_dir      = args.out_dir,
+        admission_id = args.admission,
+        force_hz     = args.force_hz,
+    )
+
+
+if __name__ == "__main__":
+    main()

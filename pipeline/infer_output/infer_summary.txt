@@ -1,0 +1,22 @@
+============================================================
+  APNEA INFERENCE SUMMARY
+============================================================
+  Source     : /Users/sathvik/Downloads/2026-04-23_ADM420994754_prepared.csv
+  Threshold  : 0.45
+  HR gate    : ±15.0 bpm
+  ECG input  : 125 Hz  (125 Hz native)
+
+  ── ADM420994754 ──────────────────────────
+  Duration          : 1.0 min
+  Total segments    : 2
+  Flagged (skipped) : 1  (1 HR mismatch, 0 poor signal)
+  Scored by model   : 0
+  Apnea detected    : 0  (0.0%)
+  Mean apnea prob   : nan
+  AHI proxy         : 0.0 /hr  → Normal
+  Mean HR diff      : 36.26 bpm
+  Max HR diff       : 70.51 bpm
+
+  AHI: <5 Normal | 5-15 Mild | 15-30 Moderate | >30 Severe
+  NOTE: Research prototype. Not for clinical use.
+============================================================

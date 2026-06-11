@@ -1,17 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from './api';
 import OverviewTab from './tabs/OverviewTab';
-import ArrhythmiaTab from './tabs/ArrhythmiaTab';
 import ApneaTab from './tabs/ApneaTab';
-import SepsisTab from './tabs/SepsisTab';
 import PipelineLogTab from './tabs/PipelineLogTab';
 
 const TABS = [
-  { id: 'overview',   label: 'Overview',    icon: '◈' },
-  { id: 'arrhythmia', label: 'Arrhythmia',  icon: '♡' },
-  { id: 'apnea',      label: 'Apnea',       icon: '◎' },
-  { id: 'sepsis',     label: 'Sepsis',      icon: '⚕' },
-  { id: 'logs',       label: 'Pipeline Log', icon: '▤' },
+  { id: 'overview', label: 'Overview', icon: '◈' },
+  { id: 'apnea', label: 'Apnea', icon: '◎' },
+  { id: 'logs', label: 'Pipeline Log', icon: '▤' },
 ];
 
 export default function App() {
@@ -124,7 +120,7 @@ export default function App() {
                 {TABS.find((t) => t.id === activeTab)?.label || 'Dashboard'}
               </h1>
               <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                Clinical Vital Signs ML Pipeline — Three-Module Analysis
+                Clinical Vital Signs ML Pipeline — Apnea Detection
               </p>
             </div>
             <div
@@ -148,11 +144,9 @@ export default function App() {
           </div>
 
           {/* Tab content */}
-          {activeTab === 'overview'   && <OverviewTab summary={summary} loading={summaryLoading} />}
-          {activeTab === 'arrhythmia' && <ArrhythmiaTab />}
-          {activeTab === 'apnea'      && <ApneaTab />}
-          {activeTab === 'sepsis'     && <SepsisTab />}
-          {activeTab === 'logs'       && <PipelineLogTab />}
+          {activeTab === 'overview' && <OverviewTab summary={summary} loading={summaryLoading} />}
+          {activeTab === 'apnea' && <ApneaTab />}
+          {activeTab === 'logs' && <PipelineLogTab />}
         </div>
       </main>
     </div>

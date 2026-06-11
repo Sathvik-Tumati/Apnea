@@ -4,16 +4,14 @@ backend.py
 FastAPI REST backend for the Vital Signs ML Dashboard.
 
 Start with:
-    uvicorn backend:app --reload --port 8000
+    ./start_backend.sh
 
 All endpoints read from vitals_pipeline.db.
 Run pipeline/pipeline.py first to populate the database.
 
 Endpoint groups
 ---------------
-/arrhythmia/*   Beat classification results and ECG plot data
 /apnea/*        Apnea segment results, signal plots, flag breakdown
-/sepsis/*       Sepsis predictions, risk distribution, vitals plots
 /summary        Combined counts across all modules
 /pipeline_log   Stage execution audit trail
 """
@@ -33,7 +31,7 @@ DB_PATH: str = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__),
 
 app = FastAPI(
     title="Vital Signs Dashboard API",
-    description="REST API for Arrhythmia / Apnea / Sepsis ML pipeline results.",
+    description="REST API for Apnea ML pipeline results.",
     version="2.0.0",
 )
 
@@ -97,17 +95,13 @@ async def _global_handler(request, exc):
 
 @app.get("/summary", tags=["Shared"])
 def summary() -> Dict[str, Any]:
-    """Combined record counts across all three modules."""
+    """Combined record counts."""
     def _count(table: str) -> int:
         row = _one(f"SELECT COUNT(*) AS n FROM {table}")
         return row["n"] if row else 0
 
     return {
-        "arrhythmia_beats": _count("arrhythmia_raw"),
-        "arrhythmia_predictions": _count("arrhythmia_predictions"),
         "apnea_segments": _count("apnea_segments"),
-        "sepsis_patients": _count("sepsis_raw"),
-        "sepsis_predictions": _count("sepsis_predictions"),
         "pipeline_stages_run": _count("pipeline_log"),
     }
 
@@ -122,114 +116,6 @@ def pipeline_log() -> List[Dict]:
 def pipeline_log_latest() -> Dict:
     """Most recently completed pipeline stage."""
     return _one("SELECT * FROM pipeline_log ORDER BY ts DESC LIMIT 1") or {}
-
-
-# ARRHYTHMIA ENDPOINTS
-
-
-@app.get("/arrhythmia/summary", tags=["Arrhythmia"])
-def arrhythmia_summary() -> Dict[str, Any]:
-    """Record counts for the arrhythmia module."""
-    def _c(t: str) -> int:
-        r = _one(f"SELECT COUNT(*) AS n FROM {t}")
-        return r["n"] if r else 0
-    return {
-        "raw_beats": _c("arrhythmia_raw"),
-        "features": _c("arrhythmia_features"),
-        "predictions": _c("arrhythmia_predictions"),
-    }
-
-
-@app.get("/arrhythmia/beat_distribution", tags=["Arrhythmia"])
-def arrhythmia_beat_distribution() -> List[Dict]:
-    """Beat type counts across all ingested ECG data."""
-    return _q("""
-        SELECT beat_type, COUNT(*) AS count
-        FROM arrhythmia_raw
-        GROUP BY beat_type
-        ORDER BY count DESC
-    """)
-
-
-@app.get("/arrhythmia/beat_distribution/source", tags=["Arrhythmia"])
-def arrhythmia_beat_by_source() -> List[Dict]:
-    """Beat counts broken down by CSV source database."""
-    return _q("""
-        SELECT source, beat_type, COUNT(*) AS count
-        FROM arrhythmia_raw
-        GROUP BY source, beat_type
-        ORDER BY source, count DESC
-    """)
-
-
-@app.get("/arrhythmia/predictions", tags=["Arrhythmia"])
-def arrhythmia_predictions(
-    limit: int = Query(200, ge=1, le=2000),
-) -> List[Dict]:
-    """Random sample of arrhythmia beat predictions."""
-    return _q("""
-        SELECT beat_ref, true_label, predicted_label, confidence
-        FROM arrhythmia_predictions
-        ORDER BY RANDOM() LIMIT ?
-    """, (limit,))
-
-
-@app.get("/arrhythmia/model_results", tags=["Arrhythmia"])
-def arrhythmia_model_results() -> List[Dict]:
-    """Arrhythmia model accuracy and per-class classification report."""
-    rows = _q("SELECT accuracy, report_json, trained_at FROM arrhythmia_results")
-    return _parse_report(rows)
-
-
-@app.get("/arrhythmia/ecg_plot", tags=["Arrhythmia"])
-def arrhythmia_ecg_plot(
-    beat_type: Optional[str] = Query(None),
-    record: Optional[str] = Query(None),
-) -> Dict:
-    """
-    Return one annotated ECG beat segment.
-
-    Response includes ecg_json (amplitude array), plus r/p/q/s/t peak indices.
-    """
-    if beat_type and record:
-        row = _one(
-            "SELECT * FROM arrhythmia_ecg_plot"
-            " WHERE beat_type=? AND record=? LIMIT 1",
-            (beat_type, record),
-        )
-    elif beat_type:
-        row = _one(
-            "SELECT * FROM arrhythmia_ecg_plot WHERE beat_type=? LIMIT 1",
-            (beat_type,),
-        )
-    else:
-        row = _one(
-            "SELECT * FROM arrhythmia_ecg_plot ORDER BY RANDOM() LIMIT 1"
-        )
-
-    if not row:
-        return {}
-
-    for field in ("ecg_json", "r_peaks_json", "p_peaks_json",
-                  "q_peaks_json", "s_peaks_json", "t_peaks_json"):
-        if row.get(field):
-            row[field.replace("_json", "")] = json.loads(row.pop(field))
-
-    return row
-
-
-@app.get("/arrhythmia/confusion_matrix", tags=["Arrhythmia"])
-def arrhythmia_confusion_matrix() -> List[Dict]:
-    """
-    Return all (true_label, predicted_label, count) triples
-    for rendering a 5×5 confusion matrix in the frontend.
-    """
-    return _q("""
-        SELECT true_label, predicted_label, COUNT(*) AS count
-        FROM arrhythmia_predictions
-        GROUP BY true_label, predicted_label
-        ORDER BY true_label, predicted_label
-    """)
 
 
 # APNEA ENDPOINTS
@@ -256,6 +142,18 @@ def apnea_summary() -> Dict[str, Any]:
     }
 
 
+@app.get("/apnea/records", tags=["Apnea"])
+def apnea_records() -> List[Dict]:
+    """Return list of distinct patient record IDs with segment counts."""
+    return _q("""
+        SELECT record, COUNT(*) AS segment_count,
+               SUM(true_label) AS apnea_count
+        FROM apnea_segments
+        GROUP BY record
+        ORDER BY segment_count DESC
+    """)
+
+
 @app.get("/apnea/segments", tags=["Apnea"])
 def apnea_segments(
     record: Optional[str] = Query(None),
@@ -274,7 +172,7 @@ def apnea_segments(
 def apnea_model_results() -> List[Dict]:
     """Apnea LSTM AUC-ROC and per-class classification report."""
     rows = _q(
-        "SELECT auc_roc, report_json, trained_at FROM apnea_results"
+        "SELECT auc_roc, report_json, trained_at FROM apnea_results ORDER BY trained_at DESC"
     )
     return _parse_report(rows)
 
@@ -365,8 +263,18 @@ def apnea_resp_plot(
 
 
 @app.get("/apnea/label_distribution", tags=["Apnea"])
-def apnea_label_distribution() -> List[Dict]:
-    """Counts per label_confidence category for the pie chart."""
+def apnea_label_distribution(
+    record: Optional[str] = Query(None),
+) -> List[Dict]:
+    """Counts per label_confidence category, optionally filtered by record."""
+    if record:
+        return _q("""
+            SELECT label_confidence, COUNT(*) AS count
+            FROM apnea_segments
+            WHERE record=?
+            GROUP BY label_confidence
+            ORDER BY count DESC
+        """, (record,))
     return _q("""
         SELECT label_confidence, COUNT(*) AS count
         FROM apnea_segments
@@ -377,12 +285,23 @@ def apnea_label_distribution() -> List[Dict]:
 
 @app.get("/apnea/signal_flags", tags=["Apnea"])
 def apnea_signal_flags(
+    record: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=2000),
 ) -> List[Dict]:
     """
-    Return per-segment signal flag breakdown for the explainability page.
-    Shows which of the 4 AASM signals fired for each segment.
+    Return per-segment signal flag breakdown, optionally filtered by record.
+    Shows which of the 3 signals (Resp, SpO2, HRV) fired for each segment.
     """
+    if record:
+        return _q("""
+            SELECT record, segment_idx,
+                   resp_flag, spo2_flag, hrv_flag, abp_flag,
+                   signals_positive, true_label, label_confidence
+            FROM apnea_segments
+            WHERE record=?
+            ORDER BY signals_positive DESC, segment_idx
+            LIMIT ?
+        """, (record, limit))
     return _q("""
         SELECT record, segment_idx,
                resp_flag, spo2_flag, hrv_flag, abp_flag,
@@ -433,140 +352,3 @@ def apnea_feature_importance() -> List[Dict]:
         result.append({"feature": col, "importance": round(diff, 4)})
 
     return sorted(result, key=lambda x: x["importance"], reverse=True)
-
-
-# SEPSIS ENDPOINTS
-
-
-@app.get("/sepsis/summary", tags=["Sepsis"])
-def sepsis_summary() -> Dict[str, Any]:
-    """Patient and prediction counts with sepsis prevalence."""
-    total = _one("SELECT COUNT(*) AS n FROM sepsis_raw")
-    pos = _one(
-        "SELECT COUNT(*) AS n FROM sepsis_features WHERE sepsis_label=1"
-    )
-    total_feat = _one("SELECT COUNT(*) AS n FROM sepsis_features")
-    results = _one(
-        "SELECT accuracy, auc_roc FROM sepsis_results"
-        " ORDER BY trained_at DESC LIMIT 1"
-    )
-    total_n = total["n"] if total else 0
-    total_f = total_feat["n"] if total_feat else 1
-    pos_n = pos["n"] if pos else 0
-    return {
-        "total_patients": total_n,
-        "sepsis_patients": pos_n,
-        "prevalence_pct": round(pos_n / max(total_f, 1) * 100, 1),
-        "accuracy": results["accuracy"] if results else None,
-        "auc_roc": results["auc_roc"] if results else None,
-    }
-
-
-@app.get("/sepsis/predictions", tags=["Sepsis"])
-def sepsis_predictions(
-    limit: int = Query(200, ge=1, le=2000),
-) -> List[Dict]:
-    """Sepsis predictions ordered by highest confidence first."""
-    return _q("""
-        SELECT subject_id, true_label, predicted_label, confidence
-        FROM sepsis_predictions
-        ORDER BY confidence DESC LIMIT ?
-    """, (limit,))
-
-
-@app.get("/sepsis/model_results", tags=["Sepsis"])
-def sepsis_model_results() -> List[Dict]:
-    """Sepsis model accuracy, AUC-ROC, and classification report."""
-    rows = _q(
-        "SELECT accuracy, auc_roc, report_json, trained_at"
-        " FROM sepsis_results"
-    )
-    return _parse_report(rows)
-
-
-@app.get("/sepsis/risk_distribution", tags=["Sepsis"])
-def sepsis_risk_distribution() -> List[Dict]:
-    """
-    Confidence score bucketed into 10 bins (0.0–0.1, 0.1–0.2, …).
-    Each bin contains counts for No Sepsis (0) and Sepsis (1).
-    """
-    rows = _q("""
-        SELECT true_label, confidence
-        FROM sepsis_predictions
-    """)
-
-    bins = [{"range": f"{i/10:.1f}-{(i+1)/10:.1f}",
-             "no_sepsis": 0, "sepsis": 0}
-            for i in range(10)]
-
-    for r in rows:
-        idx = min(int(r["confidence"] * 10), 9)
-        if r["true_label"] in ("1", 1):
-            bins[idx]["sepsis"] += 1
-        else:
-            bins[idx]["no_sepsis"] += 1
-
-    return bins
-
-
-@app.get("/sepsis/vitals_plot", tags=["Sepsis"])
-def sepsis_vitals_plot(
-    subject_id: Optional[int] = Query(None),
-) -> Dict:
-    """Return vital sign time-series for one patient."""
-    if subject_id is not None:
-        row = _one(
-            "SELECT * FROM sepsis_vitals_plot WHERE subject_id=? LIMIT 1",
-            (subject_id,),
-        )
-    else:
-        row = _one(
-            "SELECT * FROM sepsis_vitals_plot ORDER BY RANDOM() LIMIT 1"
-        )
-
-    if not row:
-        return {}
-
-    for field in ("hr_series_json", "spo2_series_json", "bp_series_json",
-                  "temp_series_json", "rr_series_json"):
-        if row.get(field):
-            row[field.replace("_json", "")] = json.loads(row.pop(field))
-
-    return row
-
-
-@app.get("/sepsis/feature_importance", tags=["Sepsis"])
-def sepsis_feature_importance() -> List[Dict]:
-    """
-    Feature importance proxy for the sepsis model using the same
-    mean-difference / pooled-std approach as the apnea endpoint.
-    """
-    all_rows = _q(
-        "SELECT sepsis_label, feature_json FROM sepsis_features LIMIT 2000"
-    )
-    if not all_rows:
-        return []
-
-    import statistics
-
-    pos = [json.loads(r["feature_json"])
-           for r in all_rows if r["sepsis_label"] == 1]
-    neg = [json.loads(r["feature_json"])
-           for r in all_rows if r["sepsis_label"] == 0]
-
-    if not pos or not neg:
-        return []
-
-    cols = list(pos[0].keys())
-    result = []
-    for col in cols:
-        pv = [d[col] for d in pos if isinstance(d.get(col), (int, float))]
-        nv = [d[col] for d in neg if isinstance(d.get(col), (int, float))]
-        if len(pv) < 2 or len(nv) < 2:
-            continue
-        diff = abs(
-            statistics.mean(pv) - statistics.mean(nv)
-        ) / (statistics.stdev(pv + nv) + 1e-6)
-        result.append({"feature": col, "importance": round(diff, 4)})
-
-    return sorted(result, key=lambda x: x["importance"], reverse=True)[:20]

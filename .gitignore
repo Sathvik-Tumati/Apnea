@@ -2,6 +2,12 @@
 venv/
 env/
 .env
+venv310/
+venv312/
+venv314/
+venv316/
+venv318/
+venv320/
 
 # Python
 __pycache__/
