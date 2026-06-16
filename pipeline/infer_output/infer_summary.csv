@@ -1,2 +1,0 @@
-admission_id,fs_source_hz,total_segments,flagged_segments,flagged_hr,flagged_quality,scored_segments,n_apnea,n_normal,apnea_pct,mean_apnea_prob,ahi_proxy,severity,duration_min,threshold,mean_hr_diff_bpm,max_hr_diff_bpm
-ADM420994754,125,2,1,1,0,0,0,0,0.0,,0.0,Normal,1.0,0.45,36.26,70.51

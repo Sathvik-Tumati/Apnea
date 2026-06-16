@@ -40,3 +40,8 @@ pipeline/pipeline.log
 .vscode/
 *.swp
 *.swo
+
+# Frontend
+dashboard/
+
+CLI/
