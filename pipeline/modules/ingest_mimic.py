@@ -12,7 +12,7 @@ except ImportError:
     HAS_WFDB = False
 from pipeline.modules.config import *
 from pipeline.modules.features import _extract_apnea_features, _detect_r_peaks
-from CLI.db.database import insert_apnea_ecg_plot, insert_apnea_features, insert_apnea_preprocessed, insert_apnea_raw, insert_apnea_segment, log_module
+from pipeline.db.database import insert_apnea_ecg_plot, insert_apnea_features, insert_apnea_preprocessed, insert_apnea_raw, insert_apnea_segment, log_module
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════

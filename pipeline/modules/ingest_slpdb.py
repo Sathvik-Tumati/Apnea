@@ -3,14 +3,15 @@ import os
 import logging
 import numpy as np
 import pandas as pd
+from scipy.signal import resample as scipy_resample
 try:
     import wfdb
     HAS_WFDB = True
 except ImportError:
     HAS_WFDB = False
 from pipeline.modules.config import *
-from pipeline.modules.features import _extract_features_slpdb
-from CLI.db.database import fetch_apnea_segments, insert_apnea_segment, log_module
+from pipeline.modules.features import _extract_features_slpdb, _bandpass
+from pipeline.db.database import fetch_apnea_segments, insert_apnea_segment, log_module
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════

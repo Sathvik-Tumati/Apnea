@@ -98,3 +98,24 @@ APNEA_FEATURE_COLS: List[str] = (
     + CROSS_FEATURE_COLS
     + MODALITY_FLAG_COLS
 )
+
+# ── Derived constants ─────────────────────────────────────────────────────────
+SAMPLES_PER_SEG: int = FS_ECG * SEGMENT_LEN_S  # 3750 samples per 30-s segment
+
+# Feature-column indices (used for modality dropout and GatherFlags layer)
+_ECG_END    = len(ECG_FEATURE_COLS)                          # 0–11
+_SPO2_START = _ECG_END                                        # 12
+_SPO2_END   = _SPO2_START + len(SPO2_FEATURE_COLS)           # 18
+_ABP_START  = _SPO2_END                                       # 18
+_ABP_END    = _ABP_START + len(ABP_FEATURE_COLS)             # 24
+_CROSS_START = _ABP_END                                       # 24
+_CROSS_END   = _CROSS_START + len(CROSS_FEATURE_COLS)        # 27
+_FLAG_START  = _CROSS_END                                     # 27
+
+_SPO2_IDXS    = list(range(_SPO2_START, _SPO2_END))
+_ABP_IDXS     = list(range(_ABP_START,  _ABP_END))
+_CROSS_IDXS   = list(range(_CROSS_START, _CROSS_END))
+
+_HAS_SPO2_IDX = APNEA_FEATURE_COLS.index("has_spo2")
+_HAS_ABP_IDX  = APNEA_FEATURE_COLS.index("has_abp")
+_HAS_RESP_IDX = APNEA_FEATURE_COLS.index("has_resp_gt")

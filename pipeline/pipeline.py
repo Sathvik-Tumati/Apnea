@@ -27,7 +27,7 @@ import tensorflow as tf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from CLI.db.database import init_db
+from pipeline.db.database import init_db
 from pipeline.modules.config import set_all_seeds, logger
 from pipeline.modules.train import run_apnea_module
 
@@ -44,9 +44,14 @@ def _parse_args() -> argparse.Namespace:
 
 def main():
     args = _parse_args()
+    if args.fresh:
+        import os
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "vitals_pipeline.db")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            logger.info("[FRESH] Deleted %s", db_path)
     init_db()
     run_apnea_module(
-        fresh=args.fresh,
         save_model=args.save_model,
         skip_slpdb=args.no_slpdb,
         slpdb_records=args.slpdb_records,

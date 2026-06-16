@@ -1,18 +1,35 @@
 from typing import Any, Dict, List, Optional, Tuple
+import datetime
 import json
 import logging
+import pickle
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import joblib
+from scipy.signal import resample as scipy_resample
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score, classification_report
-from CLI.db.database import fetch_apnea_segments, insert_apnea_results, log_module
+from pipeline.db.database import fetch_apnea_segments, insert_apnea_results, log_module
 from pipeline.modules.config import *
 from pipeline.modules.model import _build_model, _focal_loss
-from pipeline.modules.ingest_mimic import _load_mimic_records
-from pipeline.modules.ingest_slpdb import _load_slpdb_record
+from pipeline.modules.features import (
+    _extract_apnea_features, _bandpass, _detect_r_peaks,
+    _compute_edr, _resp_flag_edr, HAS_EDR_V3,
+)
+try:
+    from pipeline.compute_edr_fixed import compute_edr_v3 as _compute_edr_v3
+except ImportError:
+    _compute_edr_v3 = None
+from pipeline.modules.ingest_mimic import _load_mimic_records, _load_mimic_record_with_cache
+from pipeline.modules.ingest_slpdb import ingest_slpdb_records
+from pipeline.db.database import (
+    insert_apnea_ecg_plot, insert_apnea_features,
+    insert_apnea_preprocessed, insert_apnea_raw, insert_apnea_segment,
+)
+
+_NumpyEncoder = NumpyEncoder
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,12 +143,17 @@ def _build_combined_dataset(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_apnea_module(
-    n_records:    int  = N_MIMIC_RECORDS,
-    save_model:   bool = False,
-    use_slpdb:    bool = True,
-    slpdb_records: Optional[List[str]] = None,
+    n_records:      int  = N_MIMIC_RECORDS,
+    save_model:     bool = False,
+    use_slpdb:      bool = True,
+    skip_slpdb:     bool = False,   # alias accepted from pipeline.py --no-slpdb
+    fresh:          bool = False,   # if True, wipes DB before run
+    slpdb_records:  Optional[List[str]] = None,
     slpdb_max_segs: int = 80,
 ) -> None:
+    # Resolve slpdb flag (skip_slpdb takes priority)
+    if skip_slpdb:
+        use_slpdb = False
 
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     logger.info("=" * 65)
