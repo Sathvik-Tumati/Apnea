@@ -45,3 +45,8 @@ pipeline/pipeline.log
 dashboard/
 
 CLI/
+
+# Inference output
+infer_output/
+automation/infer_output/
+*.log
