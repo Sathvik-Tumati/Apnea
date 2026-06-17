@@ -20,6 +20,20 @@ Dual-path downsampling to 125 Hz:
   Fused  : Element-wise mean of A and B
 All downstream processing (R-peaks, HRV, EDR, features) runs at 125 Hz.
 
+SpO2 features
+-------------
+When mongo_infer.py has computed real SpO2 features and set has_spo2=1 in
+the CSV, _extract_features() reads them directly from the row instead of
+substituting neutral defaults.  The model therefore receives real SpO2
+signal whenever it is available, and the modality flag routes accordingly.
+
+AHI denominator
+---------------
+Duration is computed from actual first/last timestamps in the DataFrame
+when they are parseable, falling back to n_segments × 30s only when
+timestamps are missing or malformed.  This avoids inflating AHI when
+there are packet gaps in the recording.
+
 Workflow
 --------
 1. Train on MIMIC and save model + scaler:
@@ -64,7 +78,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── neurokit2 (checked once at import, not per segment) ──────────────────────
+# ── neurokit2 ─────────────────────────────────────────────────────────────────
 try:
     import neurokit2 as nk
     HAS_NK = True
@@ -74,24 +88,28 @@ except Exception:
     logger.warning("neurokit2 not available — using scipy R-peak fallback")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-FS_ECG        = 125     # all processing runs at this rate
+FS_ECG        = 125
 FS_RESP       = 4
 SEGMENT_LEN_S = 30
-SAMPLES_125   = 3750    # 30 s × 125 Hz
-SAMPLES_250   = 7500    # 30 s × 250 Hz
+SAMPLES_125   = 3750
+SAMPLES_250   = 7500
 TIMESTEPS     = 10
-HR_TOLERANCE  = 15.0    # bpm — gap between sub-seg instantaneous HR and 30s mean
+HR_TOLERANCE  = 15.0
 
-# Known sample counts → Hz
 KNOWN_SAMPLE_COUNTS = {3750: 125, 7500: 250}
 
-# Column name lists
 ECG_COLS_125   = [f"ecgData[{i}]" for i in range(SAMPLES_125)]
 ECG_COLS_250   = [f"ecgData[{i}]" for i in range(SAMPLES_250)]
 HR_SUBSEG_COLS = [f"analysis.segments[{i}].morphology.hr_bpm" for i in range(6)]
 SIG_QUAL_COL   = "analysis.summary.signal_quality"
 RHYTHM_COLS    = [f"analysis.segments[{i}].rhythm_label"  for i in range(6)]
 ECTOPY_COLS    = [f"analysis.segments[{i}].ectopy_label"  for i in range(6)]
+
+# SpO2 columns that mongo_infer.py may have written into the CSV
+SPO2_CSV_COLS = [
+    "spo2_mean", "spo2_min", "spo2_delta_index",
+    "odi", "t90", "spo2_approx_entropy", "has_spo2",
+]
 
 APNEA_FEATURE_COLS = [
     "rr_mean", "rr_std", "rmssd", "pnn50", "mean_hr", "hr_range", "lf_hf_ratio",
@@ -100,6 +118,7 @@ APNEA_FEATURE_COLS = [
     "spo2_mean", "spo2_min", "spo2_delta_index", "odi", "t90", "spo2_approx_entropy",
     "map_mean", "map_std", "map_variability", "sbp_max", "dbp_min", "pulse_pressure",
     "resp_spo2_lag_s", "ptt_ms", "ecg_resp_coherence",
+    "has_spo2", "has_abp", "has_resp_gt",
 ]
 
 
@@ -108,12 +127,6 @@ APNEA_FEATURE_COLS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _detect_sampling_rate(csv_path: str) -> Tuple[int, str]:
-    """
-    Auto-detect ECG sampling rate from a CSV file.
-
-    Returns (hz, evidence_string).
-    Raises ValueError if no ecgData[] columns are found.
-    """
     logger.info("[DETECT] Reading header + 3 rows from %s ...", csv_path)
     df_head = pd.read_csv(csv_path, nrows=3, low_memory=False)
 
@@ -135,35 +148,28 @@ def _detect_sampling_rate(csv_path: str) -> Tuple[int, str]:
         )
 
     hz = KNOWN_SAMPLE_COUNTS.get(n_cols)
-
     if hz is None:
-        # Unknown count — pick by proximity to 30-second segment at each candidate
         d125 = abs(n_cols / 125.0 - 30.0)
         d250 = abs(n_cols / 250.0 - 30.0)
         hz   = 125 if d125 <= d250 else 250
-        logger.warning(
-            "[DETECT] Non-standard column count %d — best guess: %d Hz "
-            "(override with --force-hz if wrong)", n_cols, hz)
+        logger.warning("[DETECT] Non-standard column count %d — best guess: %d Hz", n_cols, hz)
 
-    # Spectral sanity check — warns only, does not override column count
     ecg_sample = df_head[ecg_cols].iloc[0].values.astype(float)
     ecg_sample[np.isnan(ecg_sample)] = 0.0
     if len(ecg_sample) >= 256:
         f, pxx = welch(ecg_sample, fs=hz,
                        nperseg=min(512, len(ecg_sample) // 4), nfft=1024)
-        total  = float(np.sum(pxx)) or 1.0
-        hf_frac = float(np.sum(pxx[f > 62.5])) / total
+        total    = float(np.sum(pxx)) or 1.0
+        hf_frac  = float(np.sum(pxx[f > 62.5])) / total
         if hz == 125 and hf_frac > 0.05:
             logger.warning(
-                "[DETECT] Column count says 125 Hz but %.1f%% of spectral power "
-                "is above 62.5 Hz. File may actually be 250 Hz. "
+                "[DETECT] Column count says 125 Hz but %.1f%% power above 62.5 Hz. "
                 "Use --force-hz 250 to override.", hf_frac * 100)
         else:
             logger.info("[DETECT] Spectral check: %.1f%% power above 62.5 Hz — "
                         "consistent with %d Hz.", hf_frac * 100, hz)
 
-    evidence = (f"{n_cols} ecgData[] columns = {n_cols // hz}s × {hz} Hz "
-                f"per segment")
+    evidence = f"{n_cols} ecgData[] columns = {n_cols // hz}s × {hz} Hz per segment"
     logger.info("[DETECT] ─────────────────────────────────────────")
     logger.info("[DETECT]  Detected : %d Hz", hz)
     logger.info("[DETECT]  Evidence : %s", evidence)
@@ -172,7 +178,7 @@ def _detect_sampling_rate(csv_path: str) -> Tuple[int, str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SIGNAL PROCESSING  (shared by both Hz paths)
+#  SIGNAL PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _bandpass(sig: np.ndarray, fs: int,
@@ -185,7 +191,6 @@ def _bandpass(sig: np.ndarray, fs: int,
 
 
 def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
-    """neurokit2 preferred; robust scipy fallback."""
     if HAS_NK:
         try:
             _, info = nk.ecg_process(ecg, sampling_rate=fs)
@@ -194,7 +199,7 @@ def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
                 hr = 60.0 / (np.mean(np.diff(peaks)) / fs + 1e-9)
                 if 30 <= hr <= 200:
                     return peaks
-                logger.debug("nk peaks imply %.0f BPM — falling back to scipy", hr)
+                logger.debug("nk peaks imply %.0f BPM — scipy fallback", hr)
         except Exception as exc:
             logger.debug("nk.ecg_process: %s — scipy fallback", exc)
 
@@ -208,37 +213,21 @@ def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
 
 
 def _downsample_250_to_125(ecg_250: np.ndarray) -> np.ndarray:
-    """
-    Dual-path 250 Hz → 125 Hz downsampling.
-      Path A : Cubic spline interpolation (shape-preserving)
-      Path B : Polyphase FIR decimation   (anti-aliasing)
-      Fused  : Element-wise mean
-    """
     t_raw    = np.arange(len(ecg_250)) / 250.0
     t_target = np.arange(SAMPLES_125)  / 125.0
-
-    # Path A — cubic spline
     try:
         path_a = CubicSpline(t_raw, ecg_250, bc_type="not-a-knot")(t_target)
     except Exception:
         path_a = np.interp(t_target, t_raw, ecg_250)
-
-    # Path B — polyphase FIR
-    path_b = resample_poly(ecg_250, up=1, down=2).astype(float)
-
+    path_b  = resample_poly(ecg_250, up=1, down=2).astype(float)
     min_len = min(len(path_a), len(path_b), SAMPLES_125)
     fused   = 0.5 * (path_a[:min_len] + path_b[:min_len])
-
     if len(fused) < SAMPLES_125:
         fused = np.pad(fused, (0, SAMPLES_125 - len(fused)), mode="edge")
     return fused[:SAMPLES_125]
 
 
 def _get_ecg(row: pd.Series, hz: int) -> np.ndarray:
-    """
-    Extract ECG from a CSV row, normalise to 125 Hz, bandpass filter.
-    Handles both 125 Hz (no resampling) and 250 Hz (dual-path downsample).
-    """
     cols = ECG_COLS_250 if hz == 250 else ECG_COLS_125
     ecg  = row[cols].values.astype(float)
     if np.isnan(ecg).any():
@@ -250,7 +239,6 @@ def _get_ecg(row: pd.Series, hz: int) -> np.ndarray:
 
 def _compute_edr(ecg: np.ndarray, r_peaks: np.ndarray,
                  fs_ecg: int = FS_ECG, fs_resp: int = FS_RESP) -> np.ndarray:
-    """Dual-engine QRS-area + QRS-PCA waveform fusion EDR."""
     if len(r_peaks) < 8:
         return np.zeros(int(len(ecg) * fs_resp / fs_ecg))
     t_peaks   = r_peaks / fs_ecg
@@ -294,15 +282,21 @@ def _compute_edr(ecg: np.ndarray, r_peaks: np.ndarray,
 def _extract_features(
     ecg: np.ndarray,
     baseline: Dict[str, float],
+    row: Optional[pd.Series] = None,
 ) -> Tuple[Dict[str, float], np.ndarray, float]:
     """
     Extract APNEA_FEATURE_COLS from a 30-second ECG at 125 Hz.
+
+    SpO2 features are read from `row` when has_spo2=1 (written by mongo_infer.py),
+    otherwise the previous neutral defaults are used so ECG-only recordings
+    continue to work unchanged.
+
     Returns (feats, r_peaks, ecg_hr_bpm).
     """
     feats: Dict[str, float] = {}
     r_peaks = _detect_r_peaks(ecg, FS_ECG)
 
-    # HRV
+    # ── HRV ──────────────────────────────────────────────────────────────────
     if len(r_peaks) >= 3:
         rr_ms    = np.diff(r_peaks) / FS_ECG * 1000.0
         rr_diffs = np.diff(rr_ms)
@@ -321,7 +315,7 @@ def _extract_features(
             feats[k] = 0.0
         ecg_hr = 0.0
 
-    # EDR
+    # ── EDR / resp ────────────────────────────────────────────────────────────
     resp = _compute_edr(ecg, r_peaks)
     feats["resp_amplitude_mean"] = float(np.mean(np.abs(resp)))
     feats["resp_amplitude_std"]  = float(np.std(resp))
@@ -349,14 +343,50 @@ def _extract_features(
     except Exception:
         feats["resp_rate_bpm"] = feats["resp_rate_variability"] = 0.0
 
-    # SpO2, ABP, cross-signal — not available at inference time
+    # ── SpO2 features — read from CSV row when has_spo2=1 ────────────────────
+    has_spo2 = 0
+    if row is not None:
+        try:
+            has_spo2 = int(float(row.get("has_spo2", 0)))
+        except (TypeError, ValueError):
+            has_spo2 = 0
+
+    if has_spo2 == 1 and row is not None:
+        # Real SpO2 data written by mongo_infer.py — use it directly
+        def _safe(col, default):
+            try:
+                v = float(row.get(col, default))
+                return v if np.isfinite(v) else default
+            except (TypeError, ValueError):
+                return default
+
+        feats.update({
+            "spo2_mean":           _safe("spo2_mean",           97.0),
+            "spo2_min":            _safe("spo2_min",            97.0),
+            "spo2_delta_index":    _safe("spo2_delta_index",    0.0),
+            "odi":                 _safe("odi",                  0.0),
+            "t90":                 _safe("t90",                  0.0),
+            "spo2_approx_entropy": _safe("spo2_approx_entropy", 0.0),
+        })
+    else:
+        # ECG-only path — neutral defaults so the scaler / model still work
+        feats.update({
+            "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
+            "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
+        })
+
+    # ── ABP + cross-signal — not available at wearable inference time ─────────
     feats.update({
-        "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
-        "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
         "map_mean": 0.0, "map_std": 0.0, "map_variability": 0.0,
         "sbp_max": 0.0, "dbp_min": 0.0, "pulse_pressure": 0.0,
         "resp_spo2_lag_s": 0.0, "ptt_ms": 0.0, "ecg_resp_coherence": 0.0,
     })
+
+    # ── Modality flags ────────────────────────────────────────────────────────
+    feats["has_spo2"]    = has_spo2
+    feats["has_abp"]     = 0
+    feats["has_resp_gt"] = 0
+
     return feats, r_peaks, ecg_hr
 
 
@@ -365,7 +395,6 @@ def _extract_features(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_baseline(df: pd.DataFrame, hz: int) -> Dict[str, float]:
-    """Estimate per-patient baseline from the first quiet segments."""
     hr_vals, rmssd_vals, rr_vals = [], [], []
     for _, row in df.head(10).iterrows():
         sub_hrs = [row.get(c, np.nan) for c in HR_SUBSEG_COLS]
@@ -389,6 +418,46 @@ def _compute_baseline(df: pd.DataFrame, hz: int) -> Dict[str, float]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  AHI DURATION HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _recording_duration_min(adm_df: pd.DataFrame, n_segs: int) -> float:
+    """
+    Return recording duration in minutes.
+
+    Prefer actual first/last timestamps from the DataFrame — this correctly
+    accounts for packet gaps that would otherwise inflate AHI when using
+    n_segs × 30s as the denominator.
+
+    Falls back to n_segs × 30s if timestamps are absent or unparseable.
+    """
+    ts_col = "timestamp"
+    if ts_col not in adm_df.columns:
+        return n_segs * SEGMENT_LEN_S / 60.0
+
+    ts = pd.to_datetime(adm_df[ts_col], utc=True, errors="coerce").dropna()
+    if len(ts) < 2:
+        return n_segs * SEGMENT_LEN_S / 60.0
+
+    wall_min = (ts.max() - ts.min()).total_seconds() / 60.0
+
+    # Sanity check: wall time should be ≥ scored time and ≤ 24 h
+    scored_min = n_segs * SEGMENT_LEN_S / 60.0
+    if wall_min < scored_min or wall_min > 1440:
+        logger.warning(
+            "[AHI] Timestamp-derived duration %.1f min looks wrong "
+            "(scored=%.1f min) — falling back to segment count.",
+            wall_min, scored_min,
+        )
+        return scored_min
+
+    logger.info("[AHI] Duration from timestamps: %.1f min  "
+                "(segment-count estimate was %.1f min)",
+                wall_min, scored_min)
+    return wall_min
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  PER-ADMISSION INFERENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -407,45 +476,44 @@ def _run_one_admission(
     out_dir:   str,
     hz:        int,
 ) -> Dict:
-    """Full inference pipeline for one admission."""
     n = len(adm_df)
     ds_note = "" if hz == 125 else "  (250→125 Hz dual-path downsample)"
     logger.info("[%s] %d segments  (%.1f min)%s",
                 adm_id, n, n * SEGMENT_LEN_S / 60.0, ds_note)
 
-    baseline = _compute_baseline(adm_df, hz)
-    logger.info("[%s] Baseline: rmssd=%.1f  rr_ms=%.1f",
-                adm_id, baseline["baseline_rmssd"], baseline["baseline_rr_ms"])
+    # Log SpO2 coverage
+    if "has_spo2" in adm_df.columns:
+        n_spo2 = int((adm_df["has_spo2"].astype(float) == 1).sum())
+        logger.info("[%s] SpO2 available in %d / %d segments (%.0f%%)",
+                    adm_id, n_spo2, n, 100.0 * n_spo2 / max(n, 1))
+    else:
+        logger.info("[%s] No has_spo2 column — ECG-only mode", adm_id)
 
+    baseline   = _compute_baseline(adm_df, hz)
     rows_out   = []
     n_flag_hr  = 0
     n_flag_q   = 0
 
     for seg_i, (_, row) in enumerate(adm_df.iterrows()):
-
-        # ECG extraction + normalisation to 125 Hz
         ecg = _get_ecg(row, hz)
 
-        # Reference HR from upstream analysis
         sub_hrs       = [row.get(c, np.nan) for c in HR_SUBSEG_COLS]
         sub_hrs_valid = [v for v in sub_hrs if pd.notna(v)]
         ref_hr  = float(np.mean(sub_hrs_valid)) if sub_hrs_valid else np.nan
         ref_std = float(np.std(sub_hrs_valid))  if len(sub_hrs_valid) > 1 else 0.0
 
-        # Signal quality
         sig_qual = str(row.get(SIG_QUAL_COL, "unknown")).lower()
         qual_ok  = sig_qual in ("acceptable", "good", "excellent")
 
-        # Features
-        feats, r_peaks, ecg_hr = _extract_features(ecg, baseline)
+        # Pass the full row so SpO2 columns can be read when has_spo2=1
+        feats, r_peaks, ecg_hr = _extract_features(ecg, baseline, row=row)
 
-        # HR validation gate
         if pd.notna(ref_hr) and ecg_hr > 0:
-            hr_diff  = abs(ecg_hr - ref_hr)
-            hr_ok    = hr_diff <= HR_TOLERANCE
+            hr_diff = abs(ecg_hr - ref_hr)
+            hr_ok   = hr_diff <= HR_TOLERANCE
         else:
-            hr_diff  = np.nan
-            hr_ok    = True
+            hr_diff = np.nan
+            hr_ok   = True
 
         if not qual_ok:
             quality_flag = f"LOW_QUALITY_SIGNAL_{sig_qual.upper()}"
@@ -460,7 +528,6 @@ def _run_one_admission(
         else:
             quality_flag = "OK"
 
-        # Metadata
         rhythm_labels = [str(row.get(c, "")) for c in RHYTHM_COLS]
         ectopy_labels = [str(row.get(c, "")) for c in ECTOPY_COLS]
         feats.update({
@@ -493,16 +560,13 @@ def _run_one_admission(
     logger.info("[%s] Quality gate: %d / %d flagged (%.1f%%)",
                 adm_id, total_flagged, n, gate_pct)
     if gate_pct > 20:
-        logger.warning(
-            "[%s] %.0f%% of segments flagged — check R-peak detection quality.",
-            adm_id, gate_pct)
+        logger.warning("[%s] %.0f%% of segments flagged — check R-peak detection.",
+                       adm_id, gate_pct)
 
-    # Ensure all feature columns exist
     for c in APNEA_FEATURE_COLS:
         if c not in feat_df.columns:
             feat_df[c] = 0.0
 
-    # Model inference
     is_flagged = (feat_df["quality_flag"] != "OK").values
     X_scaled   = scaler.transform(
         feat_df[APNEA_FEATURE_COLS].fillna(0.0).values.astype(float))
@@ -524,10 +588,8 @@ def _run_one_admission(
             pred_col[si] = int(yp > threshold)
     else:
         logger.warning(
-            "[%s] Only %d segments — LSTM needs ≥%d for any predictions "
-            "(%.1f min minimum recording needed).",
-            adm_id, n, TIMESTEPS + 1,
-            (TIMESTEPS + 1) * SEGMENT_LEN_S / 60.0)
+            "[%s] Only %d segments — LSTM needs ≥%d for any predictions.",
+            adm_id, n, TIMESTEPS + 1)
 
     feat_df["apnea_prob"]  = prob_col
     feat_df["apnea_pred"]  = pred_col
@@ -542,12 +604,14 @@ def _run_one_admission(
     feat_df.to_csv(out_csv, index=False)
     logger.info("[%s] Saved → %s", adm_id, out_csv)
 
-    # Summary stats
+    # ── Summary stats ─────────────────────────────────────────────────────────
     scored    = feat_df["apnea_pred"].notna()
     n_scored  = int(scored.sum())
     n_apnea   = int(feat_df.loc[scored, "apnea_pred"].sum())
     apnea_pct = 100.0 * n_apnea / max(n_scored, 1)
-    dur_min   = n * SEGMENT_LEN_S / 60.0
+
+    # Use timestamp-derived duration for AHI denominator
+    dur_min   = _recording_duration_min(adm_df, n)
     ahi_proxy = n_apnea / max(dur_min / 60.0, 1e-6)
     mean_prob = float(np.nanmean(prob_col))
     severity  = ("Normal"       if ahi_proxy < 5  else
@@ -562,11 +626,13 @@ def _run_one_admission(
         for _, r in apnea_rows.iterrows():
             logger.info(
                 "  seg=%3d  t=%s  prob=%.3f  ecg_hr=%.1f  ref_hr=%.1f  "
-                "resp=%.1f bpm  rhythm=%s  src=%dHz",
+                "resp=%.1f bpm  spo2_mean=%.1f  has_spo2=%d  rhythm=%s  src=%dHz",
                 int(r["segment_idx"]), r.get("timestamp", ""),
                 r["apnea_prob"], r.get("ecg_hr_bpm", 0.0),
                 r.get("ref_hr_bpm", float("nan")),
                 r.get("resp_rate_bpm", 0.0),
+                r.get("spo2_mean", 97.0),
+                int(r.get("has_spo2", 0)),
                 r.get("dominant_rhythm", ""),
                 int(r.get("fs_source_hz", hz)))
     else:
@@ -610,7 +676,6 @@ def run_inference(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── Detect sampling rate ──────────────────────────────────────────────────
     if force_hz is not None:
         hz       = force_hz
         evidence = f"Forced by --force-hz {force_hz}"
@@ -623,11 +688,9 @@ def run_inference(
             logger.error("Use --force-hz 125 or --force-hz 250 to skip detection.")
             return
 
-    # ── Load model + scaler ───────────────────────────────────────────────────
     for path, label in [(model_path, "Model"), (scaler_path, "Scaler")]:
         if not os.path.exists(path):
-            logger.error("%s not found: '%s' — run pipeline.py --save-model",
-                         label, path)
+            logger.error("%s not found: '%s' — run pipeline.py --save-model", label, path)
             return
 
     logger.info("Loading model from %s", model_path)
@@ -641,14 +704,14 @@ def run_inference(
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    # ── Stream CSV ────────────────────────────────────────────────────────────
-    # Load the superset of ECG columns so that both 125 Hz and 250 Hz rows
-    # can be handled even if hz is ambiguous at load time.
+    # Include SpO2 feature columns in the load set so they arrive in the DataFrame
     ecg_cols_to_load = ECG_COLS_250 if hz == 250 else ECG_COLS_125
     needed_cols = (
         ["admissionId", "timestamp", SIG_QUAL_COL,
          "analysis.heart_rate_bpm", "analysis.background_rhythm"]
-        + HR_SUBSEG_COLS + RHYTHM_COLS + ECTOPY_COLS + ecg_cols_to_load
+        + HR_SUBSEG_COLS + RHYTHM_COLS + ECTOPY_COLS
+        + SPO2_CSV_COLS                    # ← SpO2 features + has_spo2 flag
+        + ecg_cols_to_load
     )
 
     logger.info("[LOAD] Streaming %s (%d Hz, %d ECG cols/row) ...",
@@ -679,7 +742,6 @@ def run_inference(
             logger.error("No data loaded.")
         return
 
-    # ── Run per-admission inference ───────────────────────────────────────────
     all_summaries = []
     for adm_id, chunks in admission_chunks.items():
         adm_df = pd.concat(chunks, ignore_index=True)
@@ -697,7 +759,6 @@ def run_inference(
         if summary:
             all_summaries.append(summary)
 
-    # ── Write summary files ───────────────────────────────────────────────────
     if all_summaries:
         ds_note = ("250→125 Hz dual-path downsample (cubic spline + polyphase FIR)"
                    if hz == 250 else "125 Hz native")
@@ -714,7 +775,7 @@ def run_inference(
         for s in all_summaries:
             lines += [
                 f"  ── {s['admission_id']} " + "─" * max(0, 38 - len(s['admission_id'])),
-                f"  Duration          : {s['duration_min']} min",
+                f"  Duration (wall)   : {s['duration_min']} min",
                 f"  Total segments    : {s['total_segments']}",
                 f"  Flagged (skipped) : {s['flagged_segments']}"
                 f"  ({s['flagged_hr']} HR mismatch, {s['flagged_quality']} poor signal)",
@@ -763,10 +824,8 @@ Examples
     p.add_argument("--scaler",    default="apnea_scaler.pkl")
     p.add_argument("--threshold", type=float, default=0.45)
     p.add_argument("--out-dir",   default="infer_output")
-    p.add_argument("--admission", default=None,
-                   help="Process only this admissionId (default: all)")
-    p.add_argument("--force-hz",  type=int, choices=[125, 250], default=None,
-                   help="Override auto-detection: force 125 or 250 Hz")
+    p.add_argument("--admission", default=None)
+    p.add_argument("--force-hz",  type=int, choices=[125, 250], default=None)
     return p.parse_args()
 
 
