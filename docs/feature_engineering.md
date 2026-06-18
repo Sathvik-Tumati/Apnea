@@ -1,45 +1,128 @@
 # Feature Engineering
 
-The pipeline extracts **30 distinct physiological features** for every 30-second window of data. These features are extracted regardless of the input data source, with missing modalities intelligently imputed and flagged.
+The pipeline extracts **30 distinct physiological features** for every 30-second window of data. Features are extracted regardless of input source, with missing modalities zeroed out and flagged explicitly.
 
-## 1. ECG and EDR Features (12 cols)
-Always present. If ground-truth respiratory signals are missing, we fall back to a dual-engine ECG-Derived Respiration (EDR) algorithm that fuses QRS-area tracking with PCA to extract the respiratory envelope.
+---
 
-* `rr_mean`, `rr_std`: R-R interval statistics.
-* `rmssd`, `pnn50`: Standard Heart Rate Variability (HRV) metrics indicating parasympathetic tone.
-* `mean_hr`, `hr_range`: Heart rate boundaries.
-* `lf_hf_ratio`: Autonomic nervous system balance.
-* `resp_rate_bpm`, `resp_rate_variability`: Extracted from GT Resp if available, else from EDR.
-* `flatline_duration_s`: Longest period of respiratory cessation.
-* `resp_amplitude_mean`, `resp_amplitude_std`: Depth of breathing.
+## Feature Vector Layout
 
-## 2. SpO2 / PPG Features (6 cols)
-If SpO2 is missing, these are zeroed out and the `has_spo2` flag is set to `0`.
+| Index | Group | Features | Count |
+|---|---|---|---|
+| 0–11 | ECG + EDR | HRV, heart rate, EDR-derived respiration | 12 |
+| 12–17 | SpO2 | Oxygenation statistics, desaturation events | 6 |
+| 18–23 | ABP | Arterial blood pressure statistics | 6 |
+| 24–26 | Cross-signal | Phase relationships between physiological systems | 3 |
+| 27–29 | Modality flags | `has_spo2`, `has_abp`, `has_resp_gt` | 3 |
+| **Total** | | | **30** |
 
-* `spo2_mean`, `spo2_min`: Absolute oxygenation levels.
-* `spo2_delta_index`: Sum of absolute differences between successive measurements (measures volatility).
-* `odi` (Oxygen Desaturation Index): Rate of >3% drops per hour.
-* `t90`: Time spent below 90% saturation.
-* `spo2_approx_entropy`: Signal complexity/unpredictability.
+---
 
-## 3. ABP Features (6 cols)
-If Arterial Blood Pressure is missing, these are zeroed out and `has_abp` is set to `0`.
+## 1. ECG and EDR Features (indices 0–11)
 
-* `map_mean`, `map_std`: Mean Arterial Pressure statistics.
-* `map_variability`: Coefficient of variation.
-* `sbp_max`, `dbp_min`: Systolic and diastolic extremes.
-* `pulse_pressure`: Difference between systolic and diastolic.
+Always present. Computed from the 30-second ECG segment at 125 Hz.
 
-## 4. Cross-Signal Features (3 cols)
-These measure the phase and delay relationships between different physiological systems.
+If ground-truth respiratory signals are unavailable (which is the case for all wearable/MongoDB recordings), we fall back to a **dual-engine ECG-Derived Respiration (EDR)** algorithm that fuses:
+- **QRS-area tracking**: The area under each QRS complex varies with respiration due to thoracic impedance changes
+- **PCA decomposition**: Principal component of R-peak amplitude and morphology variation, which encodes the respiratory envelope
 
-* `resp_spo2_lag_s`: Time delay between a respiratory cessation and the resulting SpO2 drop (usually 10-30s).
-* `ptt_ms` (Pulse Transit Time): Delay between ECG R-peak and PPG systolic peak. Drops during sympathetic arousal (apnea termination).
-* `ecg_resp_coherence`: Spectral coherence between heart rate and breathing (measures Respiratory Sinus Arrhythmia).
+| Feature | Description |
+|---|---|
+| `rr_mean` | Mean R-R interval (ms) |
+| `rr_std` | Standard deviation of R-R intervals (ms) |
+| `rmssd` | Root mean square of successive R-R differences — parasympathetic tone |
+| `pnn50` | Fraction of successive R-R differences > 50 ms |
+| `mean_hr` | Mean heart rate (bpm) |
+| `hr_range` | Max HR − Min HR within the segment (bpm) |
+| `lf_hf_ratio` | Low-frequency / high-frequency HRV power ratio — autonomic balance |
+| `resp_rate_bpm` | Respiratory rate (breaths/min), from GT Resp if available, else EDR |
+| `resp_rate_variability` | Std dev of breath-to-breath interval (s) |
+| `flatline_duration_s` | Longest continuous respiratory cessation (s) — key apnea indicator |
+| `resp_amplitude_mean` | Mean peak-to-trough respiratory amplitude |
+| `resp_amplitude_std` | Variability of respiratory amplitude |
 
-## 5. Modality Flags (3 cols)
-* `has_spo2`
-* `has_abp`
-* `has_resp_gt`
+---
 
-These are appended to the end of the feature vector so the neural network can dynamically route its attention.
+## 2. SpO2 Features (indices 12–17)
+
+If SpO2 is missing, all 6 values are zeroed and `has_spo2 = 0`.
+
+In the MongoDB pipeline, SpO2 comes from the device-computed 1 Hz stream (`spo2_unfiltered_data`). Alignment to ECG segments is done by timestamp matching.
+
+| Feature | Description |
+|---|---|
+| `spo2_mean` | Mean SpO2 (%) over the 30-second window |
+| `spo2_min` | Minimum SpO2 (%) — floor of oxygenation |
+| `spo2_delta_index` | Sum of absolute successive differences — volatility metric |
+| `odi` | Oxygen Desaturation Index: rate of ≥3% drops per hour |
+| `t90` | Fraction of time below 90% saturation |
+| `spo2_approx_entropy` | Approximate entropy — signal complexity/unpredictability |
+
+**Hypopnea proxy:** ODI and T90 together approximate the hypopnea component of AHI. A ≥3% SpO2 drop within 30 seconds of a respiratory event (flagged by flatline_duration_s) is the primary detection mechanism.
+
+---
+
+## 3. ABP Features (indices 18–23)
+
+If Arterial Blood Pressure is unavailable (all wearable/MongoDB recordings), all 6 values are zeroed and `has_abp = 0`.
+
+Present only in MIMIC-IV training data (hospital arterial line monitoring).
+
+| Feature | Description |
+|---|---|
+| `map_mean` | Mean Arterial Pressure (mmHg) mean |
+| `map_std` | MAP standard deviation |
+| `map_variability` | Coefficient of variation of MAP |
+| `sbp_max` | Maximum systolic blood pressure (mmHg) |
+| `dbp_min` | Minimum diastolic blood pressure (mmHg) |
+| `pulse_pressure` | SBP − DBP (mmHg) — marker of arterial stiffness and arousal |
+
+---
+
+## 4. Cross-Signal Features (indices 24–26)
+
+These capture phase and delay relationships between physiological systems. Present when multiple modalities are available.
+
+| Feature | Description |
+|---|---|
+| `resp_spo2_lag_s` | Time delay between respiratory cessation and the resulting SpO2 drop (typically 10–30 s in apnea) |
+| `ptt_ms` | Pulse Transit Time — delay between ECG R-peak and SpO2/PPG systolic peak; drops during sympathetic arousal at apnea termination |
+| `ecg_resp_coherence` | Spectral coherence between heart rate oscillations and breathing frequency (measures Respiratory Sinus Arrhythmia) |
+
+---
+
+## 5. Modality Flags (indices 27–29)
+
+Three binary indicators appended at the end of the feature vector. They are extracted from the last timestep by the `GatherFlags` layer and concatenated directly with the LSTM hidden state before classification.
+
+| Feature | Value | Meaning |
+|---|---|---|
+| `has_spo2` | 1 | SpO2 features are real measured values |
+| `has_spo2` | 0 | SpO2 features are zeroed (device not available) |
+| `has_abp` | 1 | ABP features are real (hospital arterial line) |
+| `has_abp` | 0 | ABP features are zeroed (wearable / no arterial line) |
+| `has_resp_gt` | 1 | Respiratory features from ground-truth channel |
+| `has_resp_gt` | 0 | Respiratory features derived from EDR (ECG-only) |
+
+---
+
+## AHI Proxy Calculation
+
+The AHI proxy is derived from model predictions over the sleep-filtered segment set:
+
+```
+n_apnea_segments  =  count of 30-s windows where apnea_prob ≥ threshold
+sleep_duration_h  =  n_scored_segments × 30 / 3600    (segment-count based)
+
+AHI proxy  =  n_apnea_segments / sleep_duration_h
+```
+
+**Severity classification:**
+
+| AHI | Severity |
+|---|---|
+| < 5 | Normal |
+| 5–15 | Mild |
+| 15–30 | Moderate |
+| > 30 | Severe |
+
+> **Note on denominator:** After sleep filtering, `sleep_duration_h` is computed from the number of scored segments (not wall-clock timestamps), because the sleep filter produces a non-contiguous subset of the original timeline. Using timestamp-derived duration would overcount the gap time between sleep windows.

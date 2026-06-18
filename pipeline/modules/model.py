@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import tensorflow as tf
 import keras
 from pipeline.modules.config import *
+from pipeline.modules.config import _HAS_SPO2_IDX, _HAS_ABP_IDX, _HAS_RESP_IDX
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MODEL ARCHITECTURE — MODALITY-AWARE BiLSTM

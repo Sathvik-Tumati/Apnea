@@ -62,6 +62,8 @@ import pickle
 import warnings
 from typing import Dict, List, Optional, Tuple
 
+from pipeline.modules.model import GatherFlags
+
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline

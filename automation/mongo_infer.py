@@ -3,57 +3,50 @@ mongo_infer.py
 ==============
 Pulls ECG + SpO2 data for a given admissionId from MongoDB,
 assembles 30-second segments, runs the apnea inference pipeline,
-and writes results to a local output directory (and optionally Supabase).
+and writes results to Supabase.
 
 Usage
 -----
-# Single admission
-python automation/mongo_infer.py --admission ADM1819906487
+  python automation/mongo_infer.py --admission ADM1819906487
+  python automation/mongo_infer.py --since 24h
+  python automation/mongo_infer.py --from 2026-06-01 --to 2026-06-15
+  python automation/mongo_infer.py --since 24h --dry-run
+  python automation/mongo_infer.py --since 24h --write-supabase
+  python automation/mongo_infer.py --since 24h --write-supabase --reprocess
 
-# All admissions recorded in the last 24 hours
-python automation/mongo_infer.py --since 24h
-
-# All admissions recorded between two dates
-python automation/mongo_infer.py --from 2026-06-01 --to 2026-06-15
-
-# Dry run — extract and save CSVs but skip inference
-python automation/mongo_infer.py --admission ADM1819906487 --dry-run
-
-# Write results to Supabase after inference
-python automation/mongo_infer.py --since 24h --write-supabase
-
-Environment variables (or set directly in MONGO_CONFIG / SUPABASE_CONFIG below)
---------------------------------------------------------------------------------
-MONGO_URI       = mongodb+srv://user:pass@cluster.mongodb.net/
-MONGO_DB        = your_database_name
-SUPABASE_URL    = https://your-project.supabase.co
-SUPABASE_KEY    = your-service-role-or-anon-key
-MODEL_PATH      = /path/to/apnea_model.keras      (default: apnea_model.keras)
-SCALER_PATH     = /path/to/apnea_scaler.pkl       (default: apnea_scaler.pkl)
-THRESHOLD       = 0.45                             (default: 0.45 — matches infer.py CLI default)
-OUTPUT_DIR      = /path/to/output/                (default: infer_output/)
+Environment variables (set in .env at project root)
+----------------------------------------------------
+MONGO_URI      mongodb+srv://user:pass@cluster/
+MONGO_DB       your_database_name
+SUPABASE_URL   https://your-project.supabase.co
+SUPABASE_KEY   your-service-role-or-anon-key
+MODEL_PATH     /path/to/apnea_model.keras      (default: apnea_model.keras)
+SCALER_PATH    /path/to/apnea_scaler.pkl       (default: apnea_scaler.pkl)
+THRESHOLD      0.45                             (default: 0.45 — matches infer.py)
+OUTPUT_DIR     /path/to/output/                (default: infer_output/)
 """
 
-from dotenv import load_dotenv
-load_dotenv()
+# ── .env loading — resolved path only, no bare CWD-dependent call ────────────
+from pathlib import Path as _Path
+_env_file = _Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv(_env_file)
+    except ImportError:
+        pass  # dotenv not installed — use shell exports or inline values
 
 import argparse
 import logging
 import os
+import socket
+import subprocess
 import sys
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-# ── Load .env from project root automatically ─────────────────────────────────
-_env_file = Path(__file__).resolve().parent.parent / ".env"
-if _env_file.exists():
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(_env_file)
-    except ImportError:
-        pass
 
 import numpy as np
 import pandas as pd
@@ -69,11 +62,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Sleep filter  ─────────────────────────────────────────────
+try:
+    from ecg_sleep_filter import detect_sleep_segments, filter_to_sleep
+    HAS_SLEEP_FILTER = True
+except ImportError:
+    # Fallback when running from outside the automation/ directory
+    try:
+        from automation.ecg_sleep_filter import detect_sleep_segments, filter_to_sleep
+        HAS_SLEEP_FILTER = True
+    except ImportError:
+        HAS_SLEEP_FILTER = False
+        logger.warning("[SLEEP] ecg_sleep_filter.py not importable — sleep filtering disabled")
+
 # ── MongoDB config ─────────────────────────────────────────────────────────────
 MONGO_CONFIG = {
     "uri": os.environ.get("MONGO_URI"),
     "db":  os.environ.get("MONGO_DB"),
 }
+
+# ── SSH Tunnel config ──────────────────────────────────────────────────────────
+JUMP_HOST  = "3.109.139.226"
+JUMP_USER  = "ubuntu"
+JUMP_PORT  = 22
+PEM_FILE   = os.path.join(os.path.dirname(__file__), "ls-nexus-qa-app 1.pem")
+MONGO_HOST = "10.17.131.14"
+MONGO_PORT = 27017
+LOCAL_PORT = 27018
 
 # ── Supabase config ────────────────────────────────────────────────────────────
 SUPABASE_CONFIG = {
@@ -81,24 +96,23 @@ SUPABASE_CONFIG = {
     "key": os.environ.get("SUPABASE_KEY"),
 }
 
-# ── Pipeline config ───────────────────────────────────────────────────────────
-FS_ECG              = 125
-FS_SPO2             = 100       # pleth ~100 Hz
-SEGMENT_LEN_S       = 30
-SAMPLES_SEG         = FS_ECG * SEGMENT_LEN_S        # 3750 ECG samples per segment
-SAMPLES_SPO2_SEG    = FS_SPO2 * SEGMENT_LEN_S       # 3000 SpO2 samples per segment
-SAMPLES_PER_ECG_DOC = 125
-DOCS_PER_SEG        = SAMPLES_SEG // SAMPLES_PER_ECG_DOC
-MIN_SEGMENTS        = 11
+# ── Pipeline constants ────────────────────────────────────────────────────────
+FS_ECG               = 125
+FS_SPO2              = 1      # device-computed SpO2 from spo2_unfiltered_data is 1 Hz
+SEGMENT_LEN_S        = 30
+SAMPLES_SEG          = FS_ECG  * SEGMENT_LEN_S   # 3750 ECG samples per segment
+SAMPLES_SPO2_SEG     = FS_SPO2 * SEGMENT_LEN_S   # 30 SpO2 samples per segment
+SAMPLES_PER_ECG_DOC  = 125
+MIN_SEGMENTS         = 11
 MIN_DURATION_MINUTES = 30
 COMPLETION_GAP_HOURS = 2
 
-ECG_COLS    = [f"ecgData[{i}]" for i in range(SAMPLES_SEG)]
+ECG_COLS    = [f"ecgData[{i}]"                              for i in range(SAMPLES_SEG)]
 HR_COLS     = [f"analysis.segments[{i}].morphology.hr_bpm" for i in range(6)]
-RHYTHM_COLS = [f"analysis.segments[{i}].rhythm_label" for i in range(6)]
-ECTOPY_COLS = [f"analysis.segments[{i}].ectopy_label" for i in range(6)]
+RHYTHM_COLS = [f"analysis.segments[{i}].rhythm_label"      for i in range(6)]
+ECTOPY_COLS = [f"analysis.segments[{i}].ectopy_label"      for i in range(6)]
 
-# SpO2 feature columns written into the segment CSV so infer.py can read them
+# These names must match APNEA_FEATURE_COLS in infer.py exactly.
 SPO2_FEATURE_COLS = [
     "spo2_mean", "spo2_min", "spo2_delta_index",
     "odi", "t90", "spo2_approx_entropy",
@@ -106,16 +120,95 @@ SPO2_FEATURE_COLS = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MONGODB CONNECTION
+#  SSH TUNNEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _wait_for_port(port: int, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+class _SSHTunnel:
+    """Context manager that opens an SSH tunnel if one isn't already running."""
+
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+
+    def __enter__(self) -> "_SSHTunnel":
+        if self._port_open():
+            logger.info("[SSH] Using existing tunnel on localhost:%d", LOCAL_PORT)
+            return self
+
+        if not os.path.exists(PEM_FILE):
+            raise RuntimeError(f"[SSH] PEM file not found: {PEM_FILE}")
+
+        cmd = [
+            "ssh", "-i", PEM_FILE,
+            "-L", f"{LOCAL_PORT}:{MONGO_HOST}:{MONGO_PORT}",
+            "-N",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ConnectTimeout=10",
+            "-o", "LogLevel=ERROR",
+            f"{JUMP_USER}@{JUMP_HOST}",
+            "-p", str(JUMP_PORT),
+        ]
+        logger.info("[SSH] Opening tunnel → %s:%d via %s ...",
+                    MONGO_HOST, MONGO_PORT, JUMP_HOST)
+        self.proc = subprocess.Popen(cmd,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+        time.sleep(2)
+        if self.proc.poll() is not None:
+            _, stderr = self.proc.communicate()
+            raise RuntimeError(
+                f"[SSH] Tunnel exited immediately (code {self.proc.returncode}): {stderr}")
+
+        if not _wait_for_port(LOCAL_PORT, timeout=15):
+            self.proc.terminate()
+            raise RuntimeError("[SSH] Tunnel started but port not forwarded within 15 s")
+
+        logger.info("[SSH] Tunnel open → localhost:%d", LOCAL_PORT)
+        return self
+
+    def __exit__(self, *_) -> None:
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            logger.info("[SSH] Tunnel closed")
+
+    @staticmethod
+    def _port_open() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", LOCAL_PORT), timeout=2):
+                return True
+        except OSError:
+            return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONNECTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_db():
+    """Return a pymongo database handle via the SSH tunnel."""
     try:
         from pymongo import MongoClient
     except ImportError:
         logger.error("pymongo not installed — pip install pymongo")
         sys.exit(1)
-    client = MongoClient(MONGO_CONFIG["uri"], serverSelectionTimeoutMS=10000)
+    client = MongoClient("127.0.0.1", LOCAL_PORT, serverSelectionTimeoutMS=10000)
     try:
         client.admin.command("ping")
         logger.info("[MONGO] Connected to %s", MONGO_CONFIG["db"])
@@ -125,27 +218,21 @@ def get_db():
     return client[MONGO_CONFIG["db"]]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SUPABASE CONNECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
 def get_supabase_client():
+    """Return a supabase-py client. Exits on misconfiguration."""
     try:
         from supabase import create_client, Client
     except ImportError:
         logger.error("supabase-py not installed — pip install supabase")
         sys.exit(1)
-
     url = SUPABASE_CONFIG["url"]
     key = SUPABASE_CONFIG["key"]
-
     if not url:
-        logger.error("[SUPABASE] SUPABASE_URL is not configured.")
+        logger.error("[SUPABASE] SUPABASE_URL not set")
         sys.exit(1)
     if not key:
-        logger.error("[SUPABASE] SUPABASE_KEY is not configured.")
+        logger.error("[SUPABASE] SUPABASE_KEY not set")
         sys.exit(1)
-
     client: Client = create_client(url, key)
     logger.info("[SUPABASE] Client initialised → %s", url)
     return client
@@ -158,42 +245,42 @@ def get_supabase_client():
 def find_completed_admissions(
     db,
     since_hours: Optional[float] = None,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
+    date_from:   Optional[datetime] = None,
+    date_to:     Optional[datetime] = None,
 ) -> List[Dict]:
-    pipeline = []
-    ts_filter = {}
+    """
+    Return admissions that have ended (no new ECG data for COMPLETION_GAP_HOURS)
+    and have enough data to run inference.
+    """
+    # Build time filter — handle the case where both --since and --from are given
+    # by taking the more restrictive (later) lower bound.
     since_cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)
                     if since_hours else None)
-    from_cutoff = date_from.replace(tzinfo=timezone.utc) if date_from else None
+    from_cutoff  = (date_from.replace(tzinfo=timezone.utc) if date_from else None)
 
+    ts_filter: Dict = {}
     if since_cutoff and from_cutoff:
-        # Both filters given — don't let one silently clobber the other.
-        # Merge by taking the more restrictive (later) lower bound.
         chosen = max(since_cutoff, from_cutoff)
         logger.warning(
-            "[DISCOVER] Both --since (%s) and --from (%s) were given — "
-            "using the later of the two as the cutoff: %s",
-            since_cutoff, from_cutoff, chosen,
-        )
+            "[DISCOVER] Both --since and --from given — using later bound: %s", chosen)
         ts_filter["$gte"] = chosen
     elif since_cutoff:
         ts_filter["$gte"] = since_cutoff
     elif from_cutoff:
         ts_filter["$gte"] = from_cutoff
-
     if date_to:
         ts_filter["$lte"] = date_to.replace(tzinfo=timezone.utc)
+
+    pipeline = []
     if ts_filter:
         pipeline.append({"$match": {"utcTimestamp": ts_filter}})
-
     pipeline += [
         {"$group": {
-            "_id": "$admissionId",
+            "_id":        "$admissionId",
             "facilityId": {"$first": "$facilityId"},
-            "first_ts":   {"$min": "$utcTimestamp"},
-            "last_ts":    {"$max": "$utcTimestamp"},
-            "n_docs":     {"$sum": 1},
+            "first_ts":   {"$min":   "$utcTimestamp"},
+            "last_ts":    {"$max":   "$utcTimestamp"},
+            "n_docs":     {"$sum":   1},
         }},
         {"$project": {
             "_id": 0,
@@ -202,47 +289,37 @@ def find_completed_admissions(
             "first_ts":     1,
             "last_ts":      1,
             "n_docs":       1,
-            "duration_min": {
-                "$divide": [
-                    {"$subtract": ["$last_ts", "$first_ts"]},
-                    60000,
-                ]
-            },
+            "duration_min": {"$divide": [
+                {"$subtract": ["$last_ts", "$first_ts"]}, 60000]},
         }},
     ]
 
     results = list(db.ecg_data_by_admission_id.aggregate(pipeline))
-    now = datetime.now(timezone.utc)
+    now       = datetime.now(timezone.utc)
     completed = []
     for r in results:
         last_ts = r["last_ts"]
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=timezone.utc)
-
         hours_since_last = (now - last_ts).total_seconds() / 3600
         has_enough_data  = r["duration_min"] >= MIN_DURATION_MINUTES
         recording_ended  = hours_since_last >= COMPLETION_GAP_HOURS
-
         if recording_ended and has_enough_data:
             r["hours_since_last"] = round(hours_since_last, 1)
             completed.append(r)
-            logger.info(
-                "[DISCOVER] %s  duration=%.0f min  docs=%d  "
-                "last_seen=%.1fh ago  ✓ ELIGIBLE",
-                r["admissionId"], r["duration_min"],
-                r["n_docs"], hours_since_last,
-            )
+            logger.info("[DISCOVER] %s  %.0f min  %d docs  %.1fh ago  ✓ ELIGIBLE",
+                        r["admissionId"], r["duration_min"],
+                        r["n_docs"], hours_since_last)
         else:
             reason = []
             if not recording_ended:
-                reason.append(f"still recording ({hours_since_last:.1f}h since last packet)")
+                reason.append(f"still active ({hours_since_last:.1f}h since last)")
             if not has_enough_data:
                 reason.append(f"too short ({r['duration_min']:.0f} min)")
             logger.info("[DISCOVER] %s  SKIP — %s",
                         r["admissionId"], " | ".join(reason))
 
-    logger.info("[DISCOVER] %d / %d admissions eligible",
-                len(completed), len(results))
+    logger.info("[DISCOVER] %d / %d eligible", len(completed), len(results))
     return completed
 
 
@@ -250,79 +327,64 @@ def find_completed_admissions(
 #  ECG EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_ecg_signal(db, admission_id: str) -> Tuple[np.ndarray, List[datetime], List[int]]:
+def extract_ecg_signal(
+    db, admission_id: str
+) -> Tuple[np.ndarray, List[datetime], List[int]]:
     """
+    Pull all ECG documents for this admission ordered by packetNo.
     Returns (signal, doc_timestamps, doc_chunk_lengths).
-    doc_timestamps[i] / doc_chunk_lengths[i] describe the i-th retained chunk
-    that was concatenated into `signal`, in order — this lets callers map an
-    absolute sample index back to a real timestamp without assuming every
-    document contributed exactly SAMPLES_PER_ECG_DOC samples.
+
+    doc_timestamps[i] and doc_chunk_lengths[i] describe the i-th retained
+    document chunk so callers can map a sample index back to wall-clock time.
     """
-    logger.info("[ECG] Fetching documents for %s ...", admission_id)
+    logger.info("[ECG] Fetching for %s ...", admission_id)
     docs = list(
         db.ecg_data_by_admission_id
-        .find(
-            {"admissionId": admission_id},
-            {"packetNo": 1, "utcTimestamp": 1, "value": 1, "_id": 0},
-        )
+        .find({"admissionId": admission_id},
+              {"packetNo": 1, "utcTimestamp": 1, "value": 1, "_id": 0})
         .sort("packetNo", 1)
     )
-
     if not docs:
-        logger.error("[ECG] No documents found for %s", admission_id)
+        logger.error("[ECG] No documents for %s", admission_id)
         return np.array([]), [], []
 
     logger.info("[ECG] %d documents retrieved", len(docs))
-    signal_chunks, timestamps, chunk_lengths, skipped = [], [], [], 0
+    chunks, timestamps, chunk_lengths, skipped = [], [], [], 0
 
     for doc in docs:
         raw = doc.get("value")
         if isinstance(raw, list) and len(raw) > 0:
             chunk = raw[0] if isinstance(raw[0], list) else raw
             if len(chunk) > 0:
-                signal_chunks.append(np.array(chunk, dtype=float))
+                arr = np.array(chunk, dtype=float)
+                chunks.append(arr)
                 timestamps.append(doc.get("utcTimestamp"))
-                chunk_lengths.append(len(chunk))
+                chunk_lengths.append(len(arr))
                 continue
         skipped += 1
 
     if skipped:
-        logger.warning("[ECG] Skipped %d documents with missing/empty value", skipped)
-    if not signal_chunks:
+        logger.warning("[ECG] Skipped %d docs with empty/missing value", skipped)
+    if not chunks:
         return np.array([]), [], []
 
-    # ── Validate assumed per-doc sample count / FS_ECG against reality ──────
-    # build_segment_csv and infer.py both assume each document holds
-    # SAMPLES_PER_ECG_DOC samples at FS_ECG Hz. If the device is actually
-    # sending at a different rate, every downstream segment boundary,
-    # timestamp lookup, and the AHI denominator would be silently wrong.
-    sample_lengths = np.array(chunk_lengths)
-    modal_len = int(np.bincount(sample_lengths).argmax()) if len(sample_lengths) else 0
-    if modal_len and modal_len != SAMPLES_PER_ECG_DOC:
-        implied_fs = modal_len  # docs are nominally 1 second each
+    # Validate assumed sample count per doc against reality
+    lengths_arr = np.array(chunk_lengths)
+    modal_len   = int(np.bincount(lengths_arr).argmax())
+    if modal_len != SAMPLES_PER_ECG_DOC:
         logger.error(
-            "[ECG] *** SAMPLE-RATE MISMATCH for %s *** "
-            "Documents contain %d samples/doc, but SAMPLES_PER_ECG_DOC=%d "
-            "(FS_ECG=%d) is assumed throughout the pipeline. This implies "
-            "the actual ECG rate is closer to %d Hz, not %d Hz. Refusing to "
-            "process this admission — update SAMPLES_PER_ECG_DOC/FS_ECG (or "
-            "add resampling) before re-running, otherwise segment boundaries "
-            "and the AHI denominator will be wrong by roughly %.1fx.",
-            admission_id, modal_len, SAMPLES_PER_ECG_DOC, FS_ECG,
-            implied_fs, FS_ECG, modal_len / SAMPLES_PER_ECG_DOC,
-        )
+            "[ECG] SAMPLE-RATE MISMATCH for %s: docs have %d samples, expected %d. "
+            "Update SAMPLES_PER_ECG_DOC / FS_ECG before re-running.",
+            admission_id, modal_len, SAMPLES_PER_ECG_DOC)
         return np.array([]), [], []
-    elif modal_len:
-        n_mismatched = int(np.sum(sample_lengths != modal_len))
-        if n_mismatched:
-            logger.warning(
-                "[ECG] %d / %d documents have a non-standard chunk length "
-                "(expected %d) — likely partial/edge packets; proceeding.",
-                n_mismatched, len(sample_lengths), SAMPLES_PER_ECG_DOC,
-            )
 
-    signal = np.concatenate(signal_chunks)
-    logger.info("[ECG] Signal assembled: %d samples  (%.1f minutes at %d Hz)",
+    n_odd = int(np.sum(lengths_arr != modal_len))
+    if n_odd:
+        logger.warning("[ECG] %d / %d docs have non-standard length (edge packets)",
+                       n_odd, len(lengths_arr))
+
+    signal = np.concatenate(chunks)
+    logger.info("[ECG] Assembled %d samples (%.1f min at %d Hz)",
                 len(signal), len(signal) / FS_ECG / 60, FS_ECG)
     return signal, timestamps, chunk_lengths
 
@@ -331,100 +393,49 @@ def extract_ecg_signal(db, admission_id: str) -> Tuple[np.ndarray, List[datetime
 #  SPO2 EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _validate_spo2_units(signal: np.ndarray, admission_id: str) -> bool:
-    """
-    Sanity-check whether `signal` actually looks like SpO2 percentages
-    (0-100, slow-varying) rather than a raw AC/DC pleth waveform
-    (large/arbitrary range, strong periodic oscillation at the cardiac rate).
-
-    This does NOT prove the data is correct — it only catches the common
-    failure mode where the collection stores raw photoplethysmography
-    counts instead of a computed SpO2% channel. Uses a spectral check
-    (power concentrated in the ~0.5-3 Hz pulsatile band is the signature of
-    a true AC pleth waveform; a computed SpO2% channel should show almost
-    none) rather than a simple value-range/noise heuristic, since ordinary
-    measurement noise on a real SpO2% channel can look superficially
-    "oscillatory" at the sample level.
-    """
-    if len(signal) < FS_SPO2 * 10:
-        return True  # too little data to judge either way; let it through
-
-    finite = signal[np.isfinite(signal)]
-    if len(finite) == 0:
-        return False
-
-    frac_in_range = float(np.mean((finite >= 30) & (finite <= 105)))
-
-    nperseg = min(len(finite), max(64, FS_SPO2 * 10))
-    f, pxx = welch(finite - np.mean(finite), fs=FS_SPO2, nperseg=nperseg)
-    total_power = float(np.sum(pxx)) or 1.0
-    pulsatile_band = (f >= 0.5) & (f <= 3.0)  # 30-180 bpm cardiac rate
-    pulsatile_frac = float(np.sum(pxx[pulsatile_band])) / total_power
-
-    looks_like_spo2 = frac_in_range > 0.9 and pulsatile_frac < 0.15
-
-    if not looks_like_spo2:
-        logger.error(
-            "[SPO2] *** UNIT CHECK FAILED for %s *** "
-            "%.0f%% of samples in [30,105]%%, %.0f%% of signal power is in "
-            "the 0.5-3 Hz cardiac/pulsatile band. This looks like a raw "
-            "pleth/AC waveform, not a computed SpO2%% channel. Refusing to "
-            "compute SpO2 features from this data; has_spo2 will be 0 for "
-            "this admission. Confirm what spo2_pleth_by_admission_id "
-            "actually stores before overriding this check.",
-            admission_id, frac_in_range * 100, pulsatile_frac * 100,
-        )
-        return False
-
-    logger.info("[SPO2] Unit check passed for %s (%.0f%% in-range, "
-                "%.0f%% pulsatile-band power) — treating as SpO2%%.",
-                admission_id, frac_in_range * 100, pulsatile_frac * 100)
-    return True
-
-
 def extract_spo2_signal(
     db, admission_id: str
 ) -> Tuple[np.ndarray, List[datetime], List[int]]:
     """
-    Pull SpO2 data for this admission.
-    Returns (signal, doc_timestamps, doc_chunk_lengths) at FS_SPO2 Hz, or
-    empty containers if unavailable or if the data fails the SpO2-unit
-    sanity check (see `_validate_spo2_units`) — in that case SpO2 features
-    are zeroed for the whole admission rather than computed from data that
-    may actually be a raw pleth waveform.
+    Pull device-computed SpO2 readings from spo2_unfiltered_data (1 Hz).
+    Each document holds one SpO2% value.
+
+    Returns (spo2_signal, doc_timestamps, doc_chunk_lengths).
+    doc_chunk_lengths is always a list of 1s (one sample per doc).
+
+    Returns (empty, [], []) if no data is found.
     """
     docs = list(
-        db.spo2_pleth_by_admission_id
-        .find(
-            {"admissionId": admission_id},
-            {"utcTimestamp": 1, "value": 1, "_id": 0},
-        )
+        db.spo2_unfiltered_data
+        .find({"admissionId": admission_id},
+              {"utcTimestamp": 1, "spo2.spo2": 1, "_id": 0})
         .sort("utcTimestamp", 1)
     )
-
     if not docs:
-        logger.warning("[SPO2] No pleth data for %s — SpO2 features will be zeroed",
-                       admission_id)
+        logger.warning("[SPO2] No spo2_unfiltered_data for %s", admission_id)
         return np.array([]), [], []
 
-    chunks, timestamps, chunk_lengths = [], [], []
+    values, timestamps, chunk_lengths = [], [], []
     for doc in docs:
-        raw = doc.get("value", [])
-        if isinstance(raw, list) and len(raw) > 0:
-            chunks.append(np.array(raw, dtype=float))
-            timestamps.append(doc.get("utcTimestamp"))
-            chunk_lengths.append(len(raw))
+        val = doc.get("spo2", {}).get("spo2")
+        if val is not None:
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            if 30.0 <= fval <= 105.0:      # physiological guard
+                values.append(fval)
+                timestamps.append(doc.get("utcTimestamp"))
+                chunk_lengths.append(1)    # one sample per document
 
-    if not chunks:
+    if not values:
+        logger.warning("[SPO2] All docs had out-of-range SpO2 for %s", admission_id)
         return np.array([]), [], []
 
-    signal = np.concatenate(chunks)
-    logger.info("[SPO2] %d pleth samples retrieved for %s (%.1f min at %d Hz)",
-                len(signal), admission_id, len(signal) / FS_SPO2 / 60, FS_SPO2)
-
-    if not _validate_spo2_units(signal, admission_id):
-        return np.array([]), [], []
-
+    signal = np.array(values, dtype=float)
+    logger.info("[SPO2] %d readings (1 Hz, %.1f min)  range %.0f–%.0f%%",
+                len(signal), len(signal) / FS_SPO2 / 60,
+                signal.min(), signal.max())
     return signal, timestamps, chunk_lengths
 
 
@@ -461,19 +472,17 @@ def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
 def _mean_hr(r_peaks: np.ndarray, fs: int) -> float:
     if len(r_peaks) < 2:
         return 0.0
-    rr_ms = np.diff(r_peaks) / fs * 1000.0
-    return float(60000.0 / (np.mean(rr_ms) + 1e-6))
+    return float(60000.0 / (np.mean(np.diff(r_peaks) / fs * 1000.0) + 1e-6))
 
 
 def _subseg_hrs(ecg_seg: np.ndarray, fs: int, n: int = 6) -> List[float]:
+    """Compute HR for each of n equal sub-segments of a 30s window."""
     chunk_len = len(ecg_seg) // n
     hrs = []
     for i in range(n):
         chunk = ecg_seg[i * chunk_len:(i + 1) * chunk_len]
         try:
-            bp    = _bandpass(chunk, fs)
-            peaks = _detect_r_peaks(bp, fs)
-            hrs.append(_mean_hr(peaks, fs))
+            hrs.append(_mean_hr(_detect_r_peaks(_bandpass(chunk, fs), fs), fs))
         except Exception:
             hrs.append(0.0)
     return hrs
@@ -481,47 +490,38 @@ def _subseg_hrs(ecg_seg: np.ndarray, fs: int, n: int = 6) -> List[float]:
 
 def _assess_signal_quality(
     raw_seg: np.ndarray,
-    bp_seg: np.ndarray,
-    fs: int,
+    bp_seg:  np.ndarray,
+    fs:      int,
     sub_hrs: List[float],
 ) -> str:
     """
-    Lightweight ECG signal-quality check, run per 30-second segment.
-
-    Returns "acceptable" or "poor". This intentionally errs on the side of
-    flagging real problems (flatline, saturation/clipping, no detectable
-    heartbeat) rather than trying to be a clinical-grade quality classifier —
-    it exists to stop obviously-bad segments from reaching the model, which
-    is what the downstream `qual_ok` gate in infer.py expects.
+    Return 'acceptable' or 'poor' for a 30-second ECG segment.
+    Catches: flatlines, saturation/clipping, local flatline runs, no heartbeat.
+    Errs on the side of accepting — a false 'poor' wastes a scorable segment.
     """
     if raw_seg is None or len(raw_seg) == 0:
         return "poor"
-
     finite = raw_seg[np.isfinite(raw_seg)]
     if len(finite) < 0.9 * len(raw_seg):
-        return "poor"  # too many NaN/inf samples
-
-    # Flatline: near-zero variance for a stretch that should show cardiac activity
-    sd = float(np.std(finite))
-    if sd < 1e-6:
         return "poor"
 
-    # Saturation / clipping: many samples pinned at the signal's own min or max
-    lo, hi = float(np.min(finite)), float(np.max(finite))
-    if hi > lo:
-        at_extreme = np.mean((finite <= lo + 1e-9) | (finite >= hi - 1e-9))
-        if at_extreme > 0.10:
-            return "poor"
+    sd = float(np.std(finite))
+    if sd < 1e-6:
+        return "poor"           # true flatline
 
-    # Local flatline runs: any 2+ second stretch with essentially no change
+    lo, hi = float(finite.min()), float(finite.max())
+    if hi > lo:
+        if np.mean((finite <= lo + 1e-9) | (finite >= hi - 1e-9)) > 0.10:
+            return "poor"       # signal pinned at rail > 10% of the time
+
     window = max(1, int(fs * 2))
     if len(bp_seg) >= window:
         roll_std = pd.Series(bp_seg).rolling(window).std().dropna().values
-        if len(roll_std) > 0 and float(np.min(roll_std)) < 1e-4 * (sd + 1e-9):
-            return "poor"
+        if len(roll_std) > 0 and float(roll_std.min()) < 1e-4 * (sd + 1e-9):
+            return "poor"       # local flatline run ≥ 2 s
 
-    # No physiologically plausible heartbeat detected in most sub-segments
     valid_hrs = [h for h in sub_hrs if h > 0]
+    # Need at least half of sub-segments to have a plausible heartbeat
     if len(valid_hrs) < len(sub_hrs) // 2:
         return "poor"
     if any(h < 20 or h > 220 for h in valid_hrs):
@@ -531,111 +531,191 @@ def _assess_signal_quality(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TIME ALIGNMENT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _normalize_ts(ts) -> Optional[datetime]:
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    try:
+        return pd.to_datetime(ts, utc=True).to_pydatetime()
+    except Exception:
+        return None
+
+
+def _build_time_index(
+    doc_timestamps: List, doc_lengths: List[int]
+) -> Optional[Tuple[List[Optional[datetime]], List[int]]]:
+    """
+    Build (starts, cumulative_sample_starts) from per-document metadata.
+    Returns None when fewer than 2 documents have usable timestamps.
+    """
+    starts, cum, running, n_valid = [], [], 0, 0
+    for ts, length in zip(doc_timestamps, doc_lengths):
+        norm = _normalize_ts(ts)
+        starts.append(norm)
+        cum.append(running)
+        running += length
+        if norm is not None:
+            n_valid += 1
+    return (starts, cum) if n_valid >= 2 else None
+
+
+def _sample_index_for_time(
+    target_ts:    datetime,
+    starts:       List[Optional[datetime]],
+    cum:          List[int],
+    doc_lengths:  List[int],
+    fs:           int,
+) -> Optional[int]:
+    """
+    Map a wall-clock timestamp to an absolute sample index in the concatenated
+    signal by finding the document whose window contains target_ts.
+    Returns None if no document is at or before target_ts.
+    """
+    best = None
+    for i, ts in enumerate(starts):
+        if ts is not None and ts <= target_ts:
+            best = i
+        elif ts is not None and ts > target_ts:
+            break
+    if best is None:
+        return None
+    offset_s       = (target_ts - starts[best]).total_seconds()
+    offset_samples = int(round(offset_s * fs))
+    offset_samples = max(0, min(offset_samples, doc_lengths[best]))
+    return cum[best] + offset_samples
+
+
+def _timestamp_for_sample(
+    sample_idx:  int,
+    starts:      List[Optional[datetime]],
+    cum:         List[int],
+    doc_lengths: List[int],
+    fs:          int,
+) -> Optional[datetime]:
+    """
+    Resolve a wall-clock timestamp for an absolute sample index.
+
+    Primary: use the document whose window contains sample_idx and offset
+    within it. Fallback: if that document has no timestamp (gap in
+    metadata), search outward — nearest earlier doc first, then nearest
+    later doc — for any document with a valid timestamp and offset by the
+    sample-count difference.
+
+    Returns None only if *no* document anywhere has a valid timestamp
+    (i.e. starts is all-None) — never returns a value derived from a
+    missing timestamp, which previously surfaced downstream as a blank
+    CSV cell that some consumers parse as epoch-zero, producing wildly
+    wrong "recording duration" values.
+    """
+    n = len(starts)
+    if n == 0:
+        return None
+    cum_arr = np.asarray(cum)
+    doc_idx = max(0, int(np.searchsorted(cum_arr, sample_idx, side="right")) - 1)
+
+    if starts[doc_idx] is not None:
+        offset_s = (sample_idx - cum[doc_idx]) / fs
+        return starts[doc_idx] + timedelta(seconds=offset_s)
+
+    for radius in range(1, n):
+        for j in (doc_idx - radius, doc_idx + radius):
+            if 0 <= j < n and starts[j] is not None:
+                offset_s = (sample_idx - cum[j]) / fs
+                return starts[j] + timedelta(seconds=offset_s)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SPO2 FEATURE COMPUTATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _approx_entropy(sig: np.ndarray, m: int = 2, r_factor: float = 0.2) -> float:
     """
-    Approximate entropy of a 1D signal.
-    m=2, r = r_factor * std(sig) — standard ApEn parameters.
-    Returns 0.0 for signals too short or with zero variance.
+    Approximate entropy (ApEn) of a 1D signal.
+    Standard parameters: m=2, r = r_factor × std(sig).
+    Returns 0.0 for signals that are too short or have zero variance.
+
+    Note: at FS_SPO2=1 Hz a 30-sample segment is passed directly —
+    no downsampling is needed or applied (the O(n²) cost is trivial at n=30).
     """
-    n = len(sig)
-    if n < 2 * m + 2:
-        return 0.0
+    n  = len(sig)
     sd = float(np.std(sig))
-    if sd < 1e-9:
+    if n < 2 * m + 2 or sd < 1e-9:
         return 0.0
     r = r_factor * sd
 
-    def _phi(m_val):
-        # Template vectors of length m_val
-        templates = np.array([sig[i:i + m_val] for i in range(n - m_val + 1)])
+    def _phi(mv: int) -> float:
+        templates = np.array([sig[i:i + mv] for i in range(n - mv + 1)])
         count = np.sum(
             np.max(np.abs(templates[:, None, :] - templates[None, :, :]), axis=2) <= r,
             axis=1,
         )
-        return float(np.mean(np.log(count / (n - m_val + 1) + 1e-10)))
+        return float(np.mean(np.log(count / (n - mv + 1) + 1e-10)))
 
     return abs(_phi(m) - _phi(m + 1))
 
 
-def _compute_global_spo2_baseline(spo2_signal: np.ndarray, fs: int = FS_SPO2) -> float:
+def _compute_global_spo2_baseline(spo2_signal: np.ndarray) -> float:
     """
-    Estimate a patient-level SpO2 baseline for ODI desaturation detection,
-    rather than letting each 30 s segment use its own mean as the baseline.
+    Patient-level SpO2 baseline = 90th percentile of the full recording.
 
-    Using the segment's own mean understates ODI for chronically desaturated
-    patients (dips get measured relative to an already-low segment average
-    instead of the patient's normal level). The 90th percentile of the full
-    recording is a robust proxy for "normal" saturation outside of
-    desaturation events — transient dips pull the mean down but rarely touch
-    the upper percentiles, so this stays stable even on noisy recordings.
+    Using the per-segment mean as the baseline underestimates ODI for
+    chronically desaturated patients. The 90th percentile is robust to
+    desaturation events pulling the mean down. Needs ≥ 60 samples (1 min).
     """
     finite = spo2_signal[np.isfinite(spo2_signal)]
-    if len(finite) < fs * 60:  # need at least ~1 minute of data to trust this
+    if len(finite) < FS_SPO2 * 60:
         return 97.0
-    clipped = np.clip(finite, 50.0, 100.0)
-    return float(np.percentile(clipped, 90))
+    return float(np.percentile(np.clip(finite, 50.0, 100.0), 90))
+
+
+_SPO2_DEFAULTS = {
+    "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
+    "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
+    "has_spo2": 0,
+}
 
 
 def _compute_spo2_features(
-    spo2_seg: np.ndarray,
-    fs: int = FS_SPO2,
+    spo2_seg:          np.ndarray,
     baseline_override: Optional[float] = None,
 ) -> Dict:
     """
-    Compute the 6 SpO2 features that APNEA_FEATURE_COLS expects, plus has_spo2 flag.
+    Compute the 6 SpO2 features for a 30-second window of 1 Hz SpO2 data
+    (30 samples).
 
     Features
     --------
-    spo2_mean         : mean SpO2 over the segment
-    spo2_min          : minimum SpO2
-    spo2_delta_index  : mean absolute sample-to-sample change (variability proxy)
-    odi               : oxygen desaturation index — desaturations ≥3% from a
-                        patient-level baseline (90th-percentile of the full
-                        recording, passed in as `baseline_override`) rather
-                        than the segment's own mean — per hour, scaled to the
-                        30 s window
-    t90               : fraction of segment where SpO2 < 90%
-    spo2_approx_entropy : ApEn regularity measure (low = regular, high = irregular)
+    spo2_mean          mean SpO2 in the segment
+    spo2_min           minimum SpO2
+    spo2_delta_index   mean |sample-to-sample change| — variability proxy
+    odi                oxygen desaturation events ≥ 3% below the patient-level
+                       baseline, scaled to events/hour (×120 for a 30s window)
+    t90                fraction of segment where SpO2 < 90%
+    spo2_approx_entropy ApEn regularity measure
 
-    Returns default neutral values + has_spo2=0 if the segment is empty/invalid.
+    Returns neutral defaults + has_spo2=0 for empty/invalid input.
     """
-    defaults = {
-        "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
-        "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
-        "has_spo2": 0,
-    }
-
     if spo2_seg is None or len(spo2_seg) < 10:
-        return defaults
+        return dict(_SPO2_DEFAULTS)
 
-    seg = spo2_seg.astype(float).copy()
-
-    # Clip to physiological range — raw pleth can drift outside 0-100
-    seg = np.clip(seg, 50.0, 100.0)
-
-    # Forward-fill any NaNs, then drop if still bad
+    seg = np.clip(spo2_seg.astype(float), 50.0, 100.0)
     seg = pd.Series(seg).ffill().bfill().values
     if not np.isfinite(seg).all() or np.std(seg) < 1e-9:
-        return defaults
+        return dict(_SPO2_DEFAULTS)
 
-    spo2_mean = float(np.mean(seg))
-    spo2_min  = float(np.min(seg))
-
-    # Delta index: mean |Δ| per sample
+    spo2_mean        = float(np.mean(seg))
+    spo2_min         = float(np.min(seg))
     spo2_delta_index = float(np.mean(np.abs(np.diff(seg))))
+    t90              = float(np.mean(seg < 90.0))
 
-    # T90: fraction of samples below 90%
-    t90 = float(np.mean(seg < 90.0))
-
-    # ODI: count ≥3% dips from a patient-level baseline (90th-percentile of
-    # the whole recording, passed in via baseline_override) rather than this
-    # segment's own mean. A dip = any point where seg < (baseline - 3). We
-    # count contiguous events (not individual samples) to avoid one long dip
-    # inflating the count. Falls back to the segment mean only if no
-    # recording-level baseline was supplied (e.g. when called standalone).
+    # ODI: count contiguous dip events ≥ 3% below patient-level baseline.
+    # Each segment is 30 s → scale to /hr by ×120.
+    # At 1 Hz resolution ODI per segment can only be 0, 120, 240 ... /hr.
     baseline = baseline_override if baseline_override is not None else spo2_mean
     below    = seg < (baseline - 3.0)
     n_events = 0
@@ -643,28 +723,20 @@ def _compute_spo2_features(
     for v in below:
         if v and not in_event:
             n_events += 1
-            in_event = True
+            in_event  = True
         elif not v:
-            in_event = False
-    # Scale to events per hour (segment is 30 s → ×120)
+            in_event  = False
     odi = float(n_events * 120.0)
 
-    # Approximate entropy — downsample to ~4 Hz first. SpO2 desaturation
-    # dynamics are slow (seconds-scale), so this loses no clinically
-    # relevant information while shrinking the O(n^2) template-matching
-    # array from ~3000^2 to ~120^2 (the dominant cost of _approx_entropy).
-    apen_fs = 4
-    decim   = max(1, fs // apen_fs)
-    seg_ds  = seg[::decim] if decim > 1 else seg
-    apen    = _approx_entropy(seg_ds)
+    apen = _approx_entropy(seg)
 
     return {
-        "spo2_mean":           round(spo2_mean, 3),
-        "spo2_min":            round(spo2_min, 3),
+        "spo2_mean":           round(spo2_mean,        3),
+        "spo2_min":            round(spo2_min,         3),
         "spo2_delta_index":    round(spo2_delta_index, 6),
-        "odi":                 round(odi, 2),
-        "t90":                 round(t90, 6),
-        "spo2_approx_entropy": round(apen, 6),
+        "odi":                 round(odi,              2),
+        "t90":                 round(t90,              6),
+        "spo2_approx_entropy": round(apen,             6),
         "has_spo2":            1,
     }
 
@@ -673,153 +745,73 @@ def _compute_spo2_features(
 #  CSV BUILDER  (format compatible with infer.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TIME ALIGNMENT HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _normalize_ts(ts) -> Optional[datetime]:
-    if ts is None:
-        return None
-    if isinstance(ts, datetime):
-        return ts
-    try:
-        parsed = pd.to_datetime(ts, utc=True)
-        return parsed.to_pydatetime()
-    except Exception:
-        return None
-
-
-def _build_time_index(
-    doc_timestamps: List[datetime], doc_lengths: List[int]
-) -> Optional[Tuple[List[datetime], List[int]]]:
-    """
-    Build a (start_ts_per_doc, cumulative_sample_start_per_doc) index from
-    per-document timestamps/lengths. Returns None if fewer than 2 documents
-    have usable timestamps — in that case callers should fall back to naive
-    index-based alignment.
-    """
-    starts, cum, running = [], [], 0
-    n_valid = 0
-    for ts, length in zip(doc_timestamps, doc_lengths):
-        norm = _normalize_ts(ts)
-        starts.append(norm)
-        cum.append(running)
-        running += length
-        if norm is not None:
-            n_valid += 1
-    if n_valid < 2:
-        return None
-    return starts, cum
-
-
-def _sample_index_for_time(
-    target_ts: datetime,
-    starts: List[datetime],
-    cum: List[int],
-    lengths: List[int],
-    fs: int,
-) -> Optional[int]:
-    """
-    Map a wall-clock timestamp to an absolute sample index in the
-    concatenated signal, by finding which document's time window contains
-    `target_ts` and offsetting within it. Returns None if no document has a
-    usable timestamp at or before target_ts.
-    """
-    best_idx = None
-    for i, ts in enumerate(starts):
-        if ts is not None and ts <= target_ts:
-            best_idx = i
-        elif ts is not None and ts > target_ts:
-            break
-    if best_idx is None:
-        return None
-    offset_s = (target_ts - starts[best_idx]).total_seconds()
-    offset_samples = int(round(offset_s * fs))
-    offset_samples = max(0, min(offset_samples, lengths[best_idx]))
-    return cum[best_idx] + offset_samples
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CSV BUILDER  (format compatible with infer.py)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def build_segment_csv(
-    ecg_signal: np.ndarray,
-    spo2_signal: np.ndarray,
-    admission_id: str,
-    facility_id: str,
-    packet_timestamps: List[datetime],
-    output_path: str,
-    ecg_chunk_lengths: Optional[List[int]] = None,
-    spo2_timestamps: Optional[List[datetime]] = None,
+    ecg_signal:         np.ndarray,
+    spo2_signal:        np.ndarray,
+    admission_id:       str,
+    facility_id:        str,
+    packet_timestamps:  List,
+    output_path:        str,
+    ecg_chunk_lengths:  Optional[List[int]] = None,
+    spo2_timestamps:    Optional[List]      = None,
     spo2_chunk_lengths: Optional[List[int]] = None,
 ) -> int:
     """
-    Slice ECG (and aligned SpO2 when available) into 30-second segments
-    and write a CSV that infer.py can consume.
+    Slice ECG (and aligned SpO2 when available) into 30-second segments and
+    write a CSV that infer.py can consume.
 
     SpO2 alignment
-    --------------
-    Each ECG segment's real start timestamp is resolved from
-    `packet_timestamps`/`ecg_chunk_lengths` and used to look up the matching
-    point in the SpO2 stream via `spo2_timestamps`/`spo2_chunk_lengths` —
-    i.e. segments are matched by actual wall-clock time, not by assuming
-    both streams started at the same sample index. This is robust to the
-    two streams starting at different moments and to ECG (sorted by
-    packetNo) vs SpO2 (sorted by utcTimestamp) using different orderings
-    upstream.
+    ──────────────
+    ECG segment i covers ECG samples [i×3750 : (i+1)×3750].
+    Its real start timestamp is resolved from packet_timestamps /
+    ecg_chunk_lengths and used to look up the matching point in the 1 Hz
+    SpO2 stream via spo2_timestamps / spo2_chunk_lengths.
 
-    If timestamps aren't usable for either stream (too few valid values),
-    this falls back to the original index-based alignment with a warning,
-    so the function still degrades gracefully rather than crashing.
+    Falls back to index-based alignment (assumes both streams started at
+    the same moment) when timestamp coverage is insufficient.
 
     Returns number of segments written.
     """
     n_segs = len(ecg_signal) // SAMPLES_SEG
     if n_segs < MIN_SEGMENTS:
         logger.warning(
-            "[CSV] Only %d complete segments (need ≥%d). "
-            "Recording is %.1f min — need ≥%.0f min.",
+            "[CSV] Only %d complete segments (need ≥ %d, %.1f min — need ≥ %.0f min).",
             n_segs, MIN_SEGMENTS,
             len(ecg_signal) / FS_ECG / 60,
-            MIN_SEGMENTS * SEGMENT_LEN_S / 60,
-        )
+            MIN_SEGMENTS * SEGMENT_LEN_S / 60)
         if n_segs == 0:
             return 0
 
     has_spo2_global = len(spo2_signal) >= SAMPLES_SPO2_SEG
+    global_spo2_baseline: Optional[float] = None
     if has_spo2_global:
-        logger.info("[CSV] SpO2 signal available (%d samples) — "
-                    "will compute SpO2 features per segment", len(spo2_signal))
         global_spo2_baseline = _compute_global_spo2_baseline(spo2_signal)
-        logger.info("[CSV] Patient-level SpO2 baseline (90th pct): %.1f%%",
-                    global_spo2_baseline)
+        logger.info("[CSV] SpO2 available (%d samples). "
+                    "Patient baseline (90th pct): %.1f%%",
+                    len(spo2_signal), global_spo2_baseline)
     else:
-        logger.warning("[CSV] SpO2 signal too short or missing — "
-                       "has_spo2=0 for all segments")
-        global_spo2_baseline = None
+        logger.warning("[CSV] No SpO2 — has_spo2=0 for all segments")
 
-    # Build time indexes for both streams so SpO2 can be matched to ECG by
-    # actual wall-clock time rather than by parallel array index.
+    # Build time indexes for timestamp-based SpO2 alignment
     ecg_chunk_lengths = ecg_chunk_lengths or [SAMPLES_PER_ECG_DOC] * len(packet_timestamps)
-    ecg_time_index  = _build_time_index(packet_timestamps, ecg_chunk_lengths)
-    spo2_time_index = (
+    ecg_time_idx  = _build_time_index(packet_timestamps, ecg_chunk_lengths)
+    spo2_time_idx = (
         _build_time_index(spo2_timestamps, spo2_chunk_lengths)
         if (has_spo2_global and spo2_timestamps and spo2_chunk_lengths)
         else None
     )
-    use_timestamp_alignment = has_spo2_global and ecg_time_index and spo2_time_index
-    if has_spo2_global and not use_timestamp_alignment:
+    ts_align = has_spo2_global and ecg_time_idx is not None and spo2_time_idx is not None
+    if has_spo2_global and not ts_align:
         logger.warning(
-            "[CSV] Insufficient timestamp coverage on ECG and/or SpO2 stream — "
-            "falling back to index-based SpO2 alignment (assumes both streams "
-            "started at the same moment)."
-        )
+            "[CSV] Insufficient timestamp coverage — falling back to "
+            "index-based SpO2 alignment (assumes both streams started together).")
 
-    logger.info("[CSV] Building %d × 30s segments (SpO2 alignment: %s) ...",
-                n_segs, "timestamp-based" if use_timestamp_alignment else "index-based")
-    rows = []
+    logger.info("[CSV] Building %d × 30s segments (SpO2 align: %s) ...",
+                n_segs, "timestamp" if ts_align else "index")
+
+    rows        = []
     n_spo2_segs = 0
+    n_unresolved_ts = 0
 
     for seg_i in range(n_segs):
         ecg_start = seg_i * SAMPLES_SEG
@@ -835,60 +827,53 @@ def build_segment_csv(
                    if any(h > 0 for h in sub_hrs) else 0.0)
         sig_quality = _assess_signal_quality(seg, seg_bp, FS_ECG, sub_hrs)
 
-        # ── Segment start timestamp (used for both the CSV row and SpO2 lookup) ──
-        seg_start_ts = None
-        if ecg_time_index is not None:
-            starts, cum = ecg_time_index
-            # Find the ECG doc containing ecg_start, offset within it
-            doc_idx = max(0, np.searchsorted(cum, ecg_start, side="right") - 1)
-            if starts[doc_idx] is not None:
-                offset_s = (ecg_start - cum[doc_idx]) / FS_ECG
-                seg_start_ts = starts[doc_idx] + timedelta(seconds=offset_s)
+        # ── Segment start timestamp ───────────────────────────────────────
+        # Always resolved via the cumulative-sample time index, which
+        # searches outward for the nearest document with a valid timestamp
+        # if the document covering this exact sample has none. This never
+        # silently emits "" for a segment unless *no* document in the whole
+        # admission has a usable timestamp (see _timestamp_for_sample).
+        seg_start_ts: Optional[datetime] = None
+        if ecg_time_idx is not None:
+            starts_e, cum_e = ecg_time_idx
+            seg_start_ts = _timestamp_for_sample(
+                ecg_start, starts_e, cum_e, ecg_chunk_lengths, FS_ECG)
+
         if seg_start_ts is not None:
             ts_str = str(seg_start_ts)
         else:
-            doc_idx_fallback = ecg_start // SAMPLES_PER_ECG_DOC
-            if (doc_idx_fallback < len(packet_timestamps)
-                    and packet_timestamps[doc_idx_fallback] is not None):
-                ts_str = str(packet_timestamps[doc_idx_fallback])
-            else:
-                ts_str = ""
+            ts_str = ""
+            n_unresolved_ts += 1
 
-        # ── SpO2 features ──────────────────────────────────────────────────
-        if use_timestamp_alignment and seg_start_ts is not None:
-            starts_s, cum_s = spo2_time_index
+        # ── SpO2 features ─────────────────────────────────────────────────
+        if ts_align and seg_start_ts is not None:
+            starts_s, cum_s = spo2_time_idx
             spo2_start = _sample_index_for_time(
                 seg_start_ts, starts_s, cum_s, spo2_chunk_lengths, FS_SPO2)
         else:
-            spo2_start = seg_i * SAMPLES_SPO2_SEG  # index-based fallback
+            spo2_start = seg_i * SAMPLES_SPO2_SEG if has_spo2_global else None
 
-        if spo2_start is None:
-            spo2_feats = {
-                "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
-                "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
-                "has_spo2": 0,
-            }
-        else:
+        if spo2_start is not None and has_spo2_global:
             spo2_end = spo2_start + SAMPLES_SPO2_SEG
-            if has_spo2_global and spo2_end <= len(spo2_signal):
-                spo2_seg     = spo2_signal[spo2_start:spo2_end]
-                spo2_feats   = _compute_spo2_features(
-                    spo2_seg, baseline_override=global_spo2_baseline)
-            elif has_spo2_global and spo2_start < len(spo2_signal):
-                # Partial tail segment — use whatever remains if ≥10 samples
-                spo2_seg   = spo2_signal[spo2_start:]
+            if spo2_end <= len(spo2_signal):
                 spo2_feats = _compute_spo2_features(
-                    spo2_seg, baseline_override=global_spo2_baseline)
+                    spo2_signal[spo2_start:spo2_end],
+                    baseline_override=global_spo2_baseline)
+            elif spo2_start < len(spo2_signal):
+                # Tail: partial segment — use whatever remains if ≥ 10 samples
+                spo2_feats = _compute_spo2_features(
+                    spo2_signal[spo2_start:],
+                    baseline_override=global_spo2_baseline)
             else:
-                spo2_feats = {
-                    "spo2_mean": 97.0, "spo2_min": 97.0, "spo2_delta_index": 0.0,
-                    "odi": 0.0, "t90": 0.0, "spo2_approx_entropy": 0.0,
-                    "has_spo2": 0,
-                }
+                spo2_feats = dict(_SPO2_DEFAULTS)
+        else:
+            spo2_feats = dict(_SPO2_DEFAULTS)
+
         if spo2_feats["has_spo2"] == 1:
             n_spo2_segs += 1
 
-        row: dict = {
+        # ── Build row ─────────────────────────────────────────────────────
+        row: Dict = {
             "admissionId":                     admission_id,
             "facilityId":                      facility_id,
             "timestamp":                       ts_str,
@@ -897,25 +882,23 @@ def build_segment_csv(
             "analysis.heart_rate_bpm":         round(mean_hr, 1),
             "analysis.background_rhythm":      "",
         }
-
-        # Sub-segment HR columns
         for i, hr in enumerate(sub_hrs):
             row[f"analysis.segments[{i}].morphology.hr_bpm"] = round(hr, 2)
             row[f"analysis.segments[{i}].rhythm_label"]      = ""
             row[f"analysis.segments[{i}].ectopy_label"]      = ""
-
-        # SpO2 feature columns
         row.update(spo2_feats)
-
-
-        # Raw ECG samples
-        for j, v in enumerate(seg):
-            row[f"ecgData[{j}]"] = round(float(v), 6)
-
+        row.update(dict(zip(ECG_COLS, np.round(seg.astype(float), 6).tolist())))
         rows.append(row)
 
-    out_df = pd.DataFrame(rows)
+    if n_unresolved_ts:
+        logger.warning(
+            "[CSV] %d / %d segments had no resolvable timestamp anywhere in "
+            "the admission's document metadata — written with blank "
+            "'timestamp'. Downstream timestamp-derived duration calculations "
+            "should treat these admissions' duration as unreliable.",
+            n_unresolved_ts, n_segs)
 
+    out_df = pd.DataFrame(rows)
     fixed_cols = (
         ["admissionId", "facilityId", "timestamp", "segment_idx",
          "analysis.summary.signal_quality",
@@ -932,7 +915,7 @@ def build_segment_csv(
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     out_df.to_csv(output_path, index=False)
-    logger.info("[CSV] Wrote %d segments → %s  (SpO2 available in %d / %d segments)",
+    logger.info("[CSV] Wrote %d segments → %s  (SpO2 in %d / %d segments)",
                 len(out_df), output_path, n_spo2_segs, n_segs)
     return len(out_df)
 
@@ -942,13 +925,14 @@ def build_segment_csv(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_inference_on_csv(
-    csv_path: str,
-    model_path: str,
-    scaler_path: str,
-    threshold: float,
-    out_dir: str,
+    csv_path:     str,
+    model_path:   str,
+    scaler_path:  str,
+    threshold:    float,
+    out_dir:      str,
     admission_id: str,
 ) -> Optional[Dict]:
+    """Call infer.py run_inference() and return the summary dict."""
     project_root = str(Path(__file__).resolve().parent.parent)
     pipeline_dir = str(Path(__file__).resolve().parent.parent / "pipeline")
     for p in (project_root, pipeline_dir):
@@ -967,28 +951,23 @@ def run_inference_on_csv(
     logger.info("[INFER] Running inference for %s ...", admission_id)
     try:
         run_inference(
-            csv_path     = csv_path,
-            model_path   = model_path,
-            scaler_path  = scaler_path,
-            threshold    = threshold,
-            out_dir      = out_dir,
-            admission_id = admission_id,
+            csv_path=csv_path, model_path=model_path, scaler_path=scaler_path,
+            threshold=threshold, out_dir=out_dir, admission_id=admission_id,
         )
     except Exception as e:
-        logger.error("[INFER] Inference failed for %s: %s", admission_id, e)
+        logger.error("[INFER] Failed for %s: %s", admission_id, e)
         return None
 
     summary_csv = os.path.join(out_dir, "infer_summary.csv")
     if not os.path.exists(summary_csv):
-        logger.warning("[INFER] No summary CSV found after inference for %s", admission_id)
+        logger.warning("[INFER] No summary CSV for %s", admission_id)
         return None
 
-    summary_df = pd.read_csv(summary_csv)
-    matches    = summary_df[summary_df["admission_id"] == admission_id]
+    df = pd.read_csv(summary_csv)
+    matches = df[df["admission_id"] == admission_id]
     if matches.empty:
-        logger.warning("[INFER] No summary row for %s in %s", admission_id, summary_csv)
+        logger.warning("[INFER] No row for %s in summary", admission_id)
         return None
-
     return matches.iloc[0].to_dict()
 
 
@@ -998,13 +977,14 @@ def run_inference_on_csv(
 
 def process_admission(
     db,
-    admission_id: str,
-    facility_id: str,
-    model_path: str,
-    scaler_path: str,
-    threshold: float,
-    output_dir: str,
-    dry_run: bool = False,
+    admission_id:     str,
+    facility_id:      str,
+    model_path:       str,
+    scaler_path:      str,
+    threshold:        float,
+    output_dir:       str,
+    dry_run:          bool = False,
+    no_sleep_filter:  bool = False,
 ) -> Optional[Dict]:
     logger.info("=" * 60)
     logger.info("  Processing: %s", admission_id)
@@ -1013,9 +993,9 @@ def process_admission(
     adm_out_dir = os.path.join(output_dir, admission_id)
     os.makedirs(adm_out_dir, exist_ok=True)
 
+    # ── ECG ──────────────────────────────────────────────────────────────────
     ecg_signal, packet_timestamps, ecg_chunk_lengths = extract_ecg_signal(db, admission_id)
     if len(ecg_signal) == 0:
-        logger.error("[PROCESS] No ECG signal for %s — skipping", admission_id)
         return None
 
     nan_mask = ~np.isfinite(ecg_signal)
@@ -1023,8 +1003,49 @@ def process_admission(
         ecg_signal[nan_mask] = float(np.nanmean(ecg_signal))
         logger.warning("[PROCESS] Filled %d NaN samples in ECG", int(nan_mask.sum()))
 
+    # ── SpO2 ─────────────────────────────────────────────────────────────────
     spo2_signal, spo2_timestamps, spo2_chunk_lengths = extract_spo2_signal(db, admission_id)
 
+    # ── Sleep filtering ───────────────────────────────────────────────────────
+    if HAS_SLEEP_FILTER and not no_sleep_filter:
+        sleep_df = detect_sleep_segments(
+            ecg_signal        = ecg_signal,
+            packet_timestamps = packet_timestamps,
+            ecg_chunk_lengths = ecg_chunk_lengths,
+        )
+        n_sleep = int(sleep_df["is_sleep"].sum()) if len(sleep_df) else 0
+        if n_sleep >= MIN_SEGMENTS:
+            # Trim ECG signal and timestamps to sleep segments only.
+            sleep_idxs = sleep_df.loc[sleep_df["is_sleep"] == 1, "segment_idx"].tolist()
+            ecg_signal = np.concatenate([ecg_signal[i * SAMPLES_SEG:(i + 1) * SAMPLES_SEG]
+                                          for i in sleep_idxs])
+
+            # Reuse the per-segment timestamps detect_sleep_segments already
+            # computed (correctly, via cumulative real document lengths)
+            # rather than re-deriving them here with a naive
+            # uniform-document-length assumption, which drifts whenever any
+            # document has a non-standard length ("edge packets").
+            ts_lookup = sleep_df.set_index("segment_idx")["timestamp_utc"]
+            packet_timestamps = [ts_lookup.get(i) for i in sleep_idxs]
+            ecg_chunk_lengths = [SAMPLES_SEG] * len(sleep_idxs)
+
+            # Save sleep window CSV for inspection
+            sleep_csv = os.path.join(adm_out_dir, f"{admission_id}_sleep_windows.csv")
+            sleep_df.to_csv(sleep_csv, index=False)
+            logger.info("[SLEEP] Kept %d / %d segments after sleep filter → %s",
+                        len(sleep_idxs), len(sleep_df), sleep_csv)
+        else:
+            logger.warning(
+                "[SLEEP] Only %d sleep segments detected (need ≥ %d) — "
+                "running inference on full recording instead",
+                n_sleep, MIN_SEGMENTS,
+            )
+    elif not HAS_SLEEP_FILTER:
+        logger.info("[SLEEP] Sleep filter unavailable — using full recording")
+    else:
+        logger.info("[SLEEP] Sleep filter disabled via --no-sleep-filter")
+
+    # ── Build CSV ─────────────────────────────────────────────────────────────
     csv_path = os.path.join(adm_out_dir, f"{admission_id}_segments.csv")
     n_segs = build_segment_csv(
         ecg_signal         = ecg_signal,
@@ -1037,61 +1058,71 @@ def process_admission(
         spo2_timestamps    = spo2_timestamps,
         spo2_chunk_lengths = spo2_chunk_lengths,
     )
-
     if n_segs == 0:
-        logger.error("[PROCESS] No segments built for %s", admission_id)
         return None
 
     if dry_run:
-        logger.info("[DRY RUN] CSV written to %s — skipping inference", csv_path)
+        logger.info("[DRY RUN] CSV at %s — skipping inference", csv_path)
         return {"admission_id": admission_id, "status": "dry_run", "n_segments": n_segs}
 
+    # ── Inference ─────────────────────────────────────────────────────────────
     summary = run_inference_on_csv(
-        csv_path     = csv_path,
-        model_path   = model_path,
-        scaler_path  = scaler_path,
-        threshold    = threshold,
-        out_dir      = adm_out_dir,
-        admission_id = admission_id,
+        csv_path=csv_path, model_path=model_path, scaler_path=scaler_path,
+        threshold=threshold, out_dir=adm_out_dir, admission_id=admission_id,
     )
-
     if summary:
-        logger.info(
-            "[RESULT] %s  AHI=%.1f  Severity=%s  Apnea%%=%s",
-            admission_id,
-            summary.get("ahi_proxy", 0),
-            summary.get("severity", "unknown"),
-            summary.get("apnea_pct", "?"),
-        )
+        logger.info("[RESULT] %s  AHI=%.1f  Severity=%s  Apnea%%=%s",
+                    admission_id, summary.get("ahi_proxy", 0),
+                    summary.get("severity", "?"), summary.get("apnea_pct", "?"))
     return summary
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SUPABASE RESULT WRITER
+#  SUPABASE WRITE-BACK
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_existing_result(supabase_client, admission_id: str) -> Optional[Dict]:
+    """Return the existing Supabase row for this admission, or None."""
+    try:
+        resp = (
+            supabase_client.table("apnea_results")
+            .select("admission_id,processed_at")
+            .eq("admission_id", admission_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logger.warning("[SUPABASE] Idempotency check failed for %s: %s — proceeding",
+                       admission_id, e)
+        return None
+
+
 def write_results_to_supabase(
-    supabase_client, admission_id: str, facility_id: str, summary: Dict
+    supabase_client,
+    admission_id: str,
+    facility_id:  str,
+    summary:      Dict,
 ) -> None:
     """
-    Upsert inference results into the Supabase `apnea_results` table.
+    Upsert inference results into the Supabase apnea_results table.
 
-    Expected table schema (run once in the Supabase SQL editor):
-    ──────────────────────────────────────────────────────────────
+    Required schema (run once in the SQL editor):
+    ─────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS apnea_results (
-        admission_id      TEXT PRIMARY KEY,
-        facility_id       TEXT,
-        processed_at      TIMESTAMPTZ,
-        ahi_proxy         FLOAT,
-        severity          TEXT,
-        apnea_pct         FLOAT,
-        total_segments    INT,
-        scored_segments   INT,
-        n_apnea           INT,
-        duration_min      FLOAT,
-        model_threshold   FLOAT
+        admission_id     TEXT PRIMARY KEY,
+        facility_id      TEXT,
+        processed_at     TIMESTAMPTZ,
+        ahi_proxy        FLOAT,
+        severity         TEXT,
+        apnea_pct        FLOAT,
+        total_segments   INT,
+        scored_segments  INT,
+        n_apnea          INT,
+        duration_min     FLOAT,
+        model_threshold  FLOAT
     );
-    ──────────────────────────────────────────────────────────────
     """
     record = {
         "admission_id":    admission_id,
@@ -1107,41 +1138,12 @@ def write_results_to_supabase(
         "model_threshold": summary.get("threshold"),
     }
     try:
-        (
-            supabase_client
-            .table("apnea_results")
-            .upsert(record, on_conflict="admission_id")
-            .execute()
-        )
-        logger.info("[SUPABASE] Results upserted for %s", admission_id)
+        (supabase_client.table("apnea_results")
+         .upsert(record, on_conflict="admission_id")
+         .execute())
+        logger.info("[SUPABASE] Upserted %s", admission_id)
     except Exception as e:
-        logger.error("[SUPABASE] Failed to write results for %s: %s", admission_id, e)
-
-
-def get_existing_result(supabase_client, admission_id: str) -> Optional[Dict]:
-    """
-    Check whether this admission already has a recorded result in Supabase.
-    Returns the existing row (at least `admission_id`/`processed_at`) if
-    found, else None. Used to skip redundant re-processing of admissions
-    that show up again in overlapping --since/--from windows.
-    """
-    try:
-        resp = (
-            supabase_client
-            .table("apnea_results")
-            .select("admission_id,processed_at")
-            .eq("admission_id", admission_id)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(resp, "data", None) or []
-        return rows[0] if rows else None
-    except Exception as e:
-        logger.warning(
-            "[SUPABASE] Idempotency check failed for %s: %s — proceeding "
-            "with processing anyway.", admission_id, e,
-        )
-        return None
+        logger.error("[SUPABASE] Failed for %s: %s", admission_id, e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1150,37 +1152,29 @@ def get_existing_result(supabase_client, admission_id: str) -> Optional[Dict]:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="MongoDB → ECG+SpO2 extraction → Apnea inference → Supabase",
+        description="MongoDB → ECG+SpO2 → Apnea inference → Supabase",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples
---------
-  python automation/mongo_infer.py --admission ADM1819906487
-  python automation/mongo_infer.py --since 24h
-  python automation/mongo_infer.py --from 2026-06-01 --to 2026-06-15
-  python automation/mongo_infer.py --since 24h --dry-run
-  python automation/mongo_infer.py --since 24h --write-supabase
-        """,
     )
-    p.add_argument("--admission",      default=None)
-    p.add_argument("--since",          default=None,
-                   help="Process admissions from last N hours (e.g. 24h, 8h)")
-    p.add_argument("--from",           dest="date_from", default=None,
+    p.add_argument("--admission",       default=None)
+    p.add_argument("--since",           default=None,
+                   help="Last N hours, e.g. 24h")
+    p.add_argument("--from",            dest="date_from", default=None,
                    help="Start date YYYY-MM-DD")
-    p.add_argument("--to",             dest="date_to",   default=None,
+    p.add_argument("--to",              dest="date_to",   default=None,
                    help="End date YYYY-MM-DD")
-    p.add_argument("--model",          default=os.environ.get("MODEL_PATH",  "apnea_model.keras"))
-    p.add_argument("--scaler",         default=os.environ.get("SCALER_PATH", "apnea_scaler.pkl"))
-    p.add_argument("--threshold",      type=float,
+    p.add_argument("--model",           default=os.environ.get("MODEL_PATH",  "apnea_model.keras"))
+    p.add_argument("--scaler",          default=os.environ.get("SCALER_PATH", "apnea_scaler.pkl"))
+    p.add_argument("--threshold",       type=float,
                    default=float(os.environ.get("THRESHOLD", "0.45")))
-    p.add_argument("--out-dir",        default=os.environ.get("OUTPUT_DIR",  "infer_output"))
-    p.add_argument("--dry-run",        action="store_true")
-    p.add_argument("--write-supabase", action="store_true",
+    p.add_argument("--out-dir",         default=os.environ.get("OUTPUT_DIR",  "infer_output"))
+    p.add_argument("--dry-run",         action="store_true",
+                   help="Extract CSVs but skip inference")
+    p.add_argument("--write-supabase",  action="store_true",
                    help="Write results to Supabase apnea_results table")
-    p.add_argument("--reprocess",      action="store_true",
-                   help="Process even if a Supabase result already exists "
-                        "for this admission (default: skip already-processed "
-                        "admissions when --write-supabase is set)")
+    p.add_argument("--reprocess",       action="store_true",
+                   help="Re-run even if a Supabase result already exists")
+    p.add_argument("--no-sleep-filter", action="store_true",
+                   help="Skip ECG sleep detection and run inference on the full recording")
     return p.parse_args()
 
 
@@ -1188,87 +1182,83 @@ def main() -> None:
     args = _parse_args()
 
     if not args.dry_run:
-        for path, name in [(args.model, "model"), (args.scaler, "scaler")]:
+        for path, label in [(args.model, "model"), (args.scaler, "scaler")]:
             if not os.path.exists(path):
-                logger.error("[SETUP] %s not found at %s", name, path)
+                logger.error("[SETUP] %s not found: %s", label, path)
                 logger.error("[SETUP] Train first: python pipeline/pipeline.py --fresh --save-model")
                 sys.exit(1)
 
-    db = get_db()
+    with _SSHTunnel():
+        db              = get_db()
+        supabase_client = get_supabase_client() if args.write_supabase else None
 
-    supabase_client = None
-    if args.write_supabase:
-        supabase_client = get_supabase_client()
+        # ── Resolve admissions ────────────────────────────────────────────────
+        if args.admission:
+            doc = db.ecg_data_by_admission_id.find_one(
+                {"admissionId": args.admission}, {"facilityId": 1, "_id": 0})
+            if not doc:
+                logger.error("[SETUP] %s not found in MongoDB", args.admission)
+                sys.exit(1)
+            admissions = [{"admissionId": args.admission,
+                           "facilityId":  doc.get("facilityId", "")}]
+        else:
+            since_hours = date_from = date_to = None
+            if args.since:
+                since_hours = float(args.since.replace("h", "").replace("H", ""))
+            if args.date_from:
+                date_from = datetime.strptime(args.date_from, "%Y-%m-%d")
+            if args.date_to:
+                date_to = datetime.strptime(args.date_to, "%Y-%m-%d")
+            if not any([since_hours, date_from, date_to]):
+                logger.error("[SETUP] Specify --admission, --since, or --from/--to")
+                sys.exit(1)
+            admissions = find_completed_admissions(
+                db, since_hours=since_hours,
+                date_from=date_from, date_to=date_to)
 
-    if args.admission:
-        doc = db.ecg_data_by_admission_id.find_one(
-            {"admissionId": args.admission},
-            {"facilityId": 1, "_id": 0},
-        )
-        if not doc:
-            logger.error("[SETUP] admissionId %s not found in MongoDB", args.admission)
-            sys.exit(1)
-        admissions = [{"admissionId": args.admission,
-                       "facilityId":  doc.get("facilityId", "")}]
-    else:
-        since_hours = date_from = date_to = None
-        if args.since:
-            since_hours = float(args.since.replace("h", "").replace("H", ""))
-        if args.date_from:
-            date_from = datetime.strptime(args.date_from, "%Y-%m-%d")
-        if args.date_to:
-            date_to = datetime.strptime(args.date_to, "%Y-%m-%d")
-        if not any([since_hours, date_from, date_to]):
-            logger.error("[SETUP] Specify --admission, --since, or --from/--to")
-            sys.exit(1)
-        admissions = find_completed_admissions(
-            db, since_hours=since_hours, date_from=date_from, date_to=date_to)
+        if not admissions:
+            logger.info("[MAIN] No admissions to process.")
+            return
 
-    if not admissions:
-        logger.info("[MAIN] No admissions to process.")
-        return
+        logger.info("[MAIN] %d admissions to process", len(admissions))
+        successes = failures = 0
 
-    logger.info("[MAIN] Processing %d admissions ...", len(admissions))
-    successes = failures = 0
-    for adm in admissions:
-        admission_id = adm["admissionId"]
-        facility_id  = adm.get("facilityId", "")
+        for adm in admissions:
+            admission_id = adm["admissionId"]
+            facility_id  = adm.get("facilityId", "")
 
-        if args.write_supabase and not args.dry_run and not args.reprocess and supabase_client:
-            existing = get_existing_result(supabase_client, admission_id)
-            if existing:
-                logger.info(
-                    "[MAIN] %s already processed at %s — skipping "
-                    "(use --reprocess to override)",
-                    admission_id, existing.get("processed_at"),
+            # Idempotency skip
+            if args.write_supabase and not args.dry_run and not args.reprocess:
+                existing = get_existing_result(supabase_client, admission_id)
+                if existing:
+                    logger.info("[MAIN] %s already processed at %s — skip "
+                                "(--reprocess to override)",
+                                admission_id, existing.get("processed_at"))
+                    continue
+
+            try:
+                summary = process_admission(
+                    db=db, admission_id=admission_id, facility_id=facility_id,
+                    model_path=args.model, scaler_path=args.scaler,
+                    threshold=args.threshold, output_dir=args.out_dir,
+                    dry_run=args.dry_run,
+                    no_sleep_filter=args.no_sleep_filter,
                 )
-                continue
-
-        try:
-            summary = process_admission(
-                db           = db,
-                admission_id = admission_id,
-                facility_id  = facility_id,
-                model_path   = args.model,
-                scaler_path  = args.scaler,
-                threshold    = args.threshold,
-                output_dir   = args.out_dir,
-                dry_run      = args.dry_run,
-            )
-            if summary:
-                successes += 1
-                if args.write_supabase and not args.dry_run and supabase_client:
-                    write_results_to_supabase(supabase_client, admission_id, facility_id, summary)
-            else:
+                if summary:
+                    successes += 1
+                    if args.write_supabase and not args.dry_run and supabase_client:
+                        write_results_to_supabase(
+                            supabase_client, admission_id, facility_id, summary)
+                else:
+                    failures += 1
+            except Exception as e:
+                logger.error("[MAIN] Unhandled error for %s: %s",
+                             admission_id, e, exc_info=True)
                 failures += 1
-        except Exception as e:
-            logger.error("[MAIN] Unhandled error for %s: %s", admission_id, e,
-                         exc_info=True)
-            failures += 1
 
-    logger.info("=" * 60)
-    logger.info("[DONE]  %d succeeded  |  %d failed  |  output → %s",
-                successes, failures, os.path.abspath(args.out_dir))
+        logger.info("=" * 60)
+        logger.info("[DONE]  %d succeeded  |  %d failed  |  output → %s",
+                    successes, failures, os.path.abspath(args.out_dir))
 
 
 if __name__ == "__main__":
