@@ -174,10 +174,10 @@ def _train_xgboost(save_model: bool, skip_slpdb: bool, slpdb_records) -> None:
         y_te, y_pred, target_names=["Normal", "Apnea"]))
 
     # ── Save ──────────────────────────────────────────────────────────────────
+        # ── Save ──────────────────────────────────────────────────────────────────
     if save_model:
         project_root = Path(__file__).resolve().parent.parent
-
-        xgb_path    = project_root / "apnea_model_xgb_seq.pkl"
+        xgb_path = project_root / "apnea_model_xgb_seq.pkl"
         scaler_path = project_root / "apnea_scaler_tree.pkl"
 
         with open(xgb_path, "wb") as f:
@@ -187,10 +187,15 @@ def _train_xgboost(save_model: bool, skip_slpdb: bool, slpdb_records) -> None:
 
         logger.info("[XGB] Saved → %s", xgb_path)
         logger.info("[XGB] Saved → %s", scaler_path)
+        
+        # ── Testing: reload and verify ──────────────────────────────────────
+        logger.info("[XGB] Testing reload of saved model...")
+        with open(scaler_path, "rb") as f:
+            scaler_reloaded = pickle.load(f)
+        # Use scaler_reloaded for testing if needed
+        logger.info("[XGB] Scaler reloaded successfully")
     else:
         logger.info("[XGB] --save-model not set — models not saved to disk")
-
-    logger.info("[XGB] ── XGBoost done ───────────────────────────────────")
 
 
 def main():
@@ -200,6 +205,14 @@ def main():
         db_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "vitals_pipeline.db")
         if os.path.exists(db_path):
+            confirm = input(
+                f"[FRESH] This will delete {db_path} and retrain from scratch.\n"
+                f"        Existing model files will be overwritten on --save-model.\n"
+                f"        Type 'yes' to continue: "
+            )
+            if confirm.strip().lower() != "yes":
+                logger.info("[FRESH] Aborted.")
+                sys.exit(0)
             os.remove(db_path)
             logger.info("[FRESH] Deleted %s", db_path)
 

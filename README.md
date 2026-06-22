@@ -102,9 +102,10 @@ python automation/mongo_infer.py --admission ADM1819906487 --write-supabase --re
 source venv/bin/activate
 
 # Default: trains BOTH BiLSTM and XGBoost on MIMIC-IV + SLPDB
+# Note: --fresh prompts for confirmation before deleting the DB
 python pipeline/pipeline.py --fresh --save-model
 
-# Subsequent runs reuse cached data (much faster)
+# Subsequent runs reuse cached data (no prompt, much faster)
 python pipeline/pipeline.py --save-model
 
 # Train only one model

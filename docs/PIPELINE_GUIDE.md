@@ -54,10 +54,11 @@ Downloads MIMIC-IV and SLPDB automatically, runs feature extraction, trains the 
 ```bash
 source venv/bin/activate
 
-# First run — fresh DB, downloads everything, trains BOTH models
+# Default: trains BOTH BiLSTM and XGBoost on MIMIC-IV + SLPDB
+# ⚠ --fresh will prompt for confirmation before deleting the DB
 python pipeline/pipeline.py --fresh --save-model
 
-# Subsequent runs — reuse cached MIMIC/SLPDB data
+# Subsequent runs — reuse cached MIMIC/SLPDB data (no prompt)
 python pipeline/pipeline.py --save-model
 
 # Train only one model (BiLSTM or XGBoost)
@@ -71,8 +72,14 @@ python pipeline/pipeline.py --save-model --slpdb-records slp37 slp41 slp66 slp48
 python pipeline/pipeline.py --save-model --no-slpdb
 ```
 
-> [!NOTE]
-> When running `--xgb-only`, XGBoost reads pre-built segments from `vitals_pipeline.db` populated by a prior BiLSTM run. If the DB is empty (e.g. after `--fresh`), run without `--xgb-only` first so BiLSTM populates the DB.
+> [!IMPORTANT]
+> `--fresh` now requires interactive confirmation before deleting `vitals_pipeline.db`:
+> ```
+> [FRESH] This will delete vitals_pipeline.db and retrain from scratch.
+>         Existing model files will be overwritten on --save-model.
+>         Type 'yes' to continue:
+> ```
+> Type `yes` and press Enter to proceed, or anything else (or Ctrl-C) to abort.
 
 **Saved artefacts (written to `project2/`):**
 
@@ -286,6 +293,7 @@ python pipeline/edf_test_loader.py \
 | `xgboost not installed` | Missing dependency | `pip install xgboost` |
 | `No MIMIC records fetched` | PhysioNet network timeout | Retry; PhysioNet is rate-limited |
 | `[XGB] No segments in DB` | Running `--xgb-only` on empty DB | Run BiLSTM first (without `--xgb-only`) to populate `vitals_pipeline.db` |
+| `[FRESH] Aborted.` | Typed anything other than `yes` at the confirmation prompt | Re-run and type `yes` to confirm DB deletion |
 | `MongoDB connection failed` | Wrong URI / env vars | Check `.env` — `MONGO_URI` and `MONGO_DB` |
 | `[SLEEP] Only N sleep segments` | Short recording or daytime admission | Add `--no-sleep-filter` to use full recording |
 | `[AHI] Timestamp-derived duration looks wrong` | Sleep filter trimmed timestamps; AHI falls back to segment count | Expected — AHI still computed correctly from segment count |
