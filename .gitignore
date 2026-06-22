@@ -42,6 +42,11 @@ apnea_best.keras
 apnea_scaler.pkl
 apnea_feature_cols.json
 apnea_thresholds.json
+apnea_model_lgbm_flat.pkl
+apnea_model_lgbm_seq.pkl
+apnea_model_xgb_flat.pkl
+apnea_model_xgb_seq.pkl
+apnea_scaler_tree.pkl
 
 # ── Data caches (downloaded automatically by wfdb) ────────────────────────────
 ~/.cache/slpdb/
@@ -56,6 +61,13 @@ vitals_pipeline.db-wal
 # ── Inference output ──────────────────────────────────────────────────────────
 infer_output/
 automation/infer_output/
+compare_results.csv
+compare_results.txt
+feature_importance_lgbm_flat.png
+feature_importance_lgbm_seq.png
+feature_importance_xgb_flat.png
+feature_importance_xgb_seq.png
+
 
 # ── Legacy / moved directories ────────────────────────────────────────────────
 dashboard/

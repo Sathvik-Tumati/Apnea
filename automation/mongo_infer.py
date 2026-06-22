@@ -34,7 +34,7 @@ if _env_file.exists():
         from dotenv import load_dotenv as _load_dotenv
         _load_dotenv(_env_file)
     except ImportError:
-        pass  # dotenv not installed — use shell exports or inline values
+        pass
 
 import argparse
 import logging
@@ -95,6 +95,11 @@ SUPABASE_CONFIG = {
     "url": os.environ.get("SUPABASE_URL"),
     "key": os.environ.get("SUPABASE_KEY"),
 }
+
+# ── Dual-model config ─────────────────────────────────────────────────────────
+BILSTM_MODEL_PATH  = os.environ.get("BILSTM_MODEL_PATH",  "apnea_model.keras")
+BILSTM_SCALER_PATH = os.environ.get("BILSTM_SCALER_PATH", "apnea_scaler.pkl")
+
 
 # ── Pipeline constants ────────────────────────────────────────────────────────
 FS_ECG               = 125
@@ -166,13 +171,13 @@ class _SSHTunnel:
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE,
                                      text=True)
-        time.sleep(2)
+        time.sleep(5)
         if self.proc.poll() is not None:
             _, stderr = self.proc.communicate()
             raise RuntimeError(
                 f"[SSH] Tunnel exited immediately (code {self.proc.returncode}): {stderr}")
 
-        if not _wait_for_port(LOCAL_PORT, timeout=15):
+        if not _wait_for_port(LOCAL_PORT, timeout=45):
             self.proc.terminate()
             raise RuntimeError("[SSH] Tunnel started but port not forwarded within 15 s")
 
@@ -977,14 +982,16 @@ def run_inference_on_csv(
 
 def process_admission(
     db,
-    admission_id:     str,
-    facility_id:      str,
-    model_path:       str,
-    scaler_path:      str,
-    threshold:        float,
-    output_dir:       str,
-    dry_run:          bool = False,
-    no_sleep_filter:  bool = False,
+    admission_id:      str,
+    facility_id:       str,
+    model_path:        str,
+    scaler_path:       str,
+    threshold:         float,
+    output_dir:        str,
+    dry_run:           bool = False,
+    no_sleep_filter:   bool = False,
+    bilstm_model_path: Optional[str] = None,
+    bilstm_scaler_path: Optional[str] = None,
 ) -> Optional[Dict]:
     logger.info("=" * 60)
     logger.info("  Processing: %s", admission_id)
@@ -1015,21 +1022,12 @@ def process_admission(
         )
         n_sleep = int(sleep_df["is_sleep"].sum()) if len(sleep_df) else 0
         if n_sleep >= MIN_SEGMENTS:
-            # Trim ECG signal and timestamps to sleep segments only.
             sleep_idxs = sleep_df.loc[sleep_df["is_sleep"] == 1, "segment_idx"].tolist()
             ecg_signal = np.concatenate([ecg_signal[i * SAMPLES_SEG:(i + 1) * SAMPLES_SEG]
                                           for i in sleep_idxs])
-
-            # Reuse the per-segment timestamps detect_sleep_segments already
-            # computed (correctly, via cumulative real document lengths)
-            # rather than re-deriving them here with a naive
-            # uniform-document-length assumption, which drifts whenever any
-            # document has a non-standard length ("edge packets").
             ts_lookup = sleep_df.set_index("segment_idx")["timestamp_utc"]
             packet_timestamps = [ts_lookup.get(i) for i in sleep_idxs]
             ecg_chunk_lengths = [SAMPLES_SEG] * len(sleep_idxs)
-
-            # Save sleep window CSV for inspection
             sleep_csv = os.path.join(adm_out_dir, f"{admission_id}_sleep_windows.csv")
             sleep_df.to_csv(sleep_csv, index=False)
             logger.info("[SLEEP] Kept %d / %d segments after sleep filter → %s",
@@ -1038,8 +1036,7 @@ def process_admission(
             logger.warning(
                 "[SLEEP] Only %d sleep segments detected (need ≥ %d) — "
                 "running inference on full recording instead",
-                n_sleep, MIN_SEGMENTS,
-            )
+                n_sleep, MIN_SEGMENTS)
     elif not HAS_SLEEP_FILTER:
         logger.info("[SLEEP] Sleep filter unavailable — using full recording")
     else:
@@ -1065,16 +1062,69 @@ def process_admission(
         logger.info("[DRY RUN] CSV at %s — skipping inference", csv_path)
         return {"admission_id": admission_id, "status": "dry_run", "n_segments": n_segs}
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-    summary = run_inference_on_csv(
+    # ── Primary model inference (XGBoost) ─────────────────────────────────────
+    summary_xgb = run_inference_on_csv(
         csv_path=csv_path, model_path=model_path, scaler_path=scaler_path,
         threshold=threshold, out_dir=adm_out_dir, admission_id=admission_id,
     )
-    if summary:
-        logger.info("[RESULT] %s  AHI=%.1f  Severity=%s  Apnea%%=%s",
-                    admission_id, summary.get("ahi_proxy", 0),
-                    summary.get("severity", "?"), summary.get("apnea_pct", "?"))
-    return summary
+    if not summary_xgb:
+        logger.error("[INFER] Primary model failed for %s", admission_id)
+        return None
+
+    # ── Secondary model inference (BiLSTM) — optional ─────────────────────────
+    summary_bilstm = None
+    run_bilstm = (
+        bilstm_model_path and bilstm_scaler_path
+        and os.path.exists(bilstm_model_path)
+        and os.path.exists(bilstm_scaler_path)
+    )
+    if run_bilstm:
+        logger.info("[INFER] Running BiLSTM for consensus ...")
+        bilstm_out_dir = os.path.join(adm_out_dir, "bilstm")
+        os.makedirs(bilstm_out_dir, exist_ok=True)
+        summary_bilstm = run_inference_on_csv(
+            csv_path=csv_path, model_path=bilstm_model_path,
+            scaler_path=bilstm_scaler_path, threshold=0.45,
+            out_dir=bilstm_out_dir, admission_id=admission_id,
+        )
+        if summary_bilstm:
+            logger.info("[INFER] BiLSTM  AHI=%.1f  Severity=%s",
+                        summary_bilstm.get("ahi_proxy", 0),
+                        summary_bilstm.get("severity", "?"))
+        else:
+            logger.warning("[INFER] BiLSTM inference failed — consensus unavailable")
+    else:
+        logger.info("[INFER] BiLSTM paths not provided — skipping consensus")
+
+    # ── Consensus ─────────────────────────────────────────────────────────────
+    xgb_normal    = (summary_xgb.get("ahi_proxy", 0) or 0) < 5.0
+    if summary_bilstm:
+        bilstm_normal = (summary_bilstm.get("ahi_proxy", 0) or 0) < 5.0
+        models_agree  = xgb_normal == bilstm_normal
+        needs_review  = not models_agree
+    else:
+        bilstm_normal = None
+        models_agree  = None
+        needs_review  = False
+
+    summary_xgb["ahi_bilstm"]    = summary_bilstm.get("ahi_proxy") if summary_bilstm else None
+    summary_xgb["severity_bilstm"] = summary_bilstm.get("severity") if summary_bilstm else None
+    summary_xgb["models_agree"]  = models_agree
+    summary_xgb["needs_review"]  = needs_review
+
+    if models_agree is not None:
+        agree_str = "✓ AGREE" if models_agree else "✗ DISAGREE — flagged for review"
+        logger.info(
+            "[CONSENSUS] XGB=%.1f(%s)  BiLSTM=%.1f(%s)  %s",
+            summary_xgb.get("ahi_proxy", 0), summary_xgb.get("severity", "?"),
+            summary_bilstm.get("ahi_proxy", 0), summary_bilstm.get("severity", "?"),
+            agree_str,
+        )
+
+    logger.info("[RESULT] %s  AHI=%.1f  Severity=%s  Apnea%%=%s",
+                admission_id, summary_xgb.get("ahi_proxy", 0),
+                summary_xgb.get("severity", "?"), summary_xgb.get("apnea_pct", "?"))
+    return summary_xgb
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1105,43 +1155,38 @@ def write_results_to_supabase(
     facility_id:  str,
     summary:      Dict,
 ) -> None:
-    """
-    Upsert inference results into the Supabase apnea_results table.
+    ahi = summary.get("ahi_proxy") or 0
+    apnea_label = ("No Apnea" if ahi < 5 else
+                   "Mild"     if ahi < 15 else
+                   "Moderate" if ahi < 30 else "Severe")
 
-    Required schema (run once in the SQL editor):
-    ─────────────────────────────────────────────
-    CREATE TABLE IF NOT EXISTS apnea_results (
-        admission_id     TEXT PRIMARY KEY,
-        facility_id      TEXT,
-        processed_at     TIMESTAMPTZ,
-        ahi_proxy        FLOAT,
-        severity         TEXT,
-        apnea_pct        FLOAT,
-        total_segments   INT,
-        scored_segments  INT,
-        n_apnea          INT,
-        duration_min     FLOAT,
-        model_threshold  FLOAT
-    );
-    """
     record = {
         "admission_id":    admission_id,
         "facility_id":     facility_id,
         "processed_at":    datetime.now(timezone.utc).isoformat(),
-        "ahi_proxy":       summary.get("ahi_proxy"),
+        "ahi_proxy":       ahi,
         "severity":        summary.get("severity"),
+        "apnea_label":     apnea_label,
+        "has_apnea":       ahi >= 5.0,
         "apnea_pct":       summary.get("apnea_pct"),
         "total_segments":  summary.get("total_segments"),
         "scored_segments": summary.get("scored_segments"),
         "n_apnea":         summary.get("n_apnea"),
         "duration_min":    summary.get("duration_min"),
         "model_threshold": summary.get("threshold"),
+        # Consensus fields
+        "ahi_bilstm":      summary.get("ahi_bilstm"),
+        "severity_bilstm": summary.get("severity_bilstm"),
+        "models_agree":    summary.get("models_agree"),
+        "needs_review":    summary.get("needs_review", False),
     }
     try:
         (supabase_client.table("apnea_results")
          .upsert(record, on_conflict="admission_id")
          .execute())
-        logger.info("[SUPABASE] Upserted %s", admission_id)
+        review_flag = " ⚠ NEEDS REVIEW" if record["needs_review"] else ""
+        logger.info("[SUPABASE] Upserted %s (AHI=%.1f, %s)%s",
+                    admission_id, ahi, apnea_label, review_flag)
     except Exception as e:
         logger.error("[SUPABASE] Failed for %s: %s", admission_id, e)
 
@@ -1155,6 +1200,10 @@ def _parse_args() -> argparse.Namespace:
         description="MongoDB → ECG+SpO2 → Apnea inference → Supabase",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--model-bilstm",  default=os.environ.get("BILSTM_MODEL_PATH",  "apnea_model.keras"),
+               help="Path to BiLSTM .keras for consensus (optional)")
+    p.add_argument("--scaler-bilstm", default=os.environ.get("BILSTM_SCALER_PATH", "apnea_scaler.pkl"),
+               help="Path to BiLSTM scaler for consensus (optional)")
     p.add_argument("--admission",       default=None)
     p.add_argument("--since",           default=None,
                    help="Last N hours, e.g. 24h")
@@ -1243,6 +1292,8 @@ def main() -> None:
                     threshold=args.threshold, output_dir=args.out_dir,
                     dry_run=args.dry_run,
                     no_sleep_filter=args.no_sleep_filter,
+                    bilstm_model_path=args.model_bilstm,
+                    bilstm_scaler_path=args.scaler_bilstm,
                 )
                 if summary:
                     successes += 1

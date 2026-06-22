@@ -62,8 +62,6 @@ import pickle
 import warnings
 from typing import Dict, List, Optional, Tuple
 
-from pipeline.modules.model import GatherFlags
-
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
@@ -579,7 +577,17 @@ def _run_one_admission(
 
     if len(X_seq) > 0:
         logger.info("[%s] Running model on %d sequences ...", adm_id, len(X_seq))
-        y_prob = model.predict(X_seq, verbose=0, batch_size=64).flatten()
+        
+        # ── PREDICT (supports both Keras and XGBoost) ────────────────────────
+        if hasattr(model, "predict_proba"):
+            # XGBoost/LightGBM tree model
+            X_seq_flat = X_seq.reshape(len(X_seq), -1)
+            y_prob = model.predict_proba(X_seq_flat)[:, 1]
+            logger.info("[%s] Using predict_proba for tree model", adm_id)
+        else:
+            # Keras BiLSTM
+            y_prob = model.predict(X_seq, verbose=0, batch_size=64).flatten()
+        
         for j, yp in enumerate(y_prob):
             si = j + TIMESTEPS
             if si >= n:
@@ -695,10 +703,22 @@ def run_inference(
             logger.error("%s not found: '%s' — run pipeline.py --save-model", label, path)
             return
 
+    # ── MODEL LOADING (supports both Keras .keras and XGBoost .pkl) ─────────
     logger.info("Loading model from %s", model_path)
     try:
-        import tensorflow as tf
-        model = tf.keras.models.load_model(model_path, compile=False)
+        if model_path.endswith(".pkl"):
+            # XGBoost / LightGBM tree model
+            with open(model_path, "rb") as f:
+                model = pickle.load(f)
+            model_type = "xgboost"
+            logger.info("Model type: XGBoost (tree-based)")
+        else:
+            # Keras BiLSTM
+            import tensorflow as tf
+            from pipeline.modules.model import GatherFlags
+            model = tf.keras.models.load_model(model_path, compile=False)
+            model_type = "keras"
+            logger.info("Model type: Keras (BiLSTM)")
     except Exception as exc:
         logger.error("Failed to load model: %s", exc)
         return
@@ -769,6 +789,8 @@ def run_inference(
             "  APNEA INFERENCE SUMMARY",
             "=" * 60,
             f"  Source     : {csv_path}",
+            f"  Model      : {model_path}",
+            f"  Model type : {model_type}",
             f"  Threshold  : {threshold}",
             f"  HR gate    : ±{HR_TOLERANCE} bpm",
             f"  ECG input  : {hz} Hz  ({ds_note})",

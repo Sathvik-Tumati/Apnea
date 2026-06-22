@@ -43,17 +43,17 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 FS_ECG        = 125
 SEGMENT_LEN_S = 30
-SAMPLES_SEG   = FS_ECG * SEGMENT_LEN_S   # 3750
+SAMPLES_SEG   = FS_ECG * SEGMENT_LEN_S  
 
 # Time-of-day gate: keep segments between 9pm and 9am IST
-SLEEP_HOUR_START = 21   # 9pm IST
-SLEEP_HOUR_END   =  9   # 9am IST
+SLEEP_HOUR_START = 21  
+SLEEP_HOUR_END   =  9   
 
 # Sleep scoring thresholds
-HR_PERCENTILE_THRESHOLD  = 45   # HR below this percentile of recording → sleep candidate
-SDNN_PERCENTILE_THRESHOLD = 55  # SDNN above this percentile → sleep candidate
-MIN_SLEEP_EPOCHS          = 40  # 40 × 30s = 20 minutes minimum sleep bout
-MAX_WAKE_GAP_EPOCHS       =  6  #  6 × 30s =  3 minutes — bridge short wake gaps
+HR_PERCENTILE_THRESHOLD  = 45  
+SDNN_PERCENTILE_THRESHOLD = 55  
+MIN_SLEEP_EPOCHS          = 40 
+MAX_WAKE_GAP_EPOCHS       =  6  
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,6 +1,12 @@
-# Modality-Aware BiLSTM Architecture
+# Model Architecture
 
-This pipeline is built around a custom **Modality-Aware Bidirectional LSTM** designed to handle the realities of multi-sensor data where signals frequently drop out or are simply unavailable (like when transitioning from hospital monitors to consumer wearables).
+This pipeline trains **two complementary models** on the same MIMIC-IV + SLPDB data and the same train/val/test split (stratified, `random_state=42`), so performance is directly comparable.
+
+---
+
+## Model 1: Modality-Aware BiLSTM
+
+The primary deep-learning model.
 
 ---
 
@@ -120,3 +126,40 @@ def _focal_loss(gamma=2.0, alpha=0.75):
 | Class weighting | `{normal: 1.0, apnea: N_normal/N_apnea}` |
 | Modality dropout rate | 30% (SpO2), 30% (ABP) on MIMIC segments |
 | Sequence length (TIMESTEPS) | 10 (consecutive 30s epochs = 5 min context) |
+
+---
+
+## Model 2: XGBoost (seq)
+
+A gradient-boosted tree model that uses the same sequences as the BiLSTM but flattens them: each input is `(T, F)` → `(T×F,)` where T=10 timesteps, F=30 features, producing a 300-dimensional feature vector per sample.
+
+### Why XGBoost alongside BiLSTM?
+
+- **Interpretability**: XGBoost provides native feature importance, making it easier to explain which physiological signals drove a prediction.
+- **Speed**: No GPU required at inference time — XGBoost runs purely on CPU.
+- **Consensus**: When both models agree on normal/abnormal, confidence is higher. When they disagree, the case is flagged for review.
+- **Robustness**: Gradient boosted trees handle missing values and feature scale differences more gracefully than a neural network without explicit architecture changes.
+
+### XGBoost Hyperparameters
+
+| Hyperparameter | Value |
+|---|---|
+| `n_estimators` | 500 (with early stopping) |
+| `max_depth` | 6 |
+| `learning_rate` | 0.05 |
+| `subsample` | 0.8 |
+| `colsample_bytree` | 0.8 |
+| `scale_pos_weight` | `N_neg / N_pos` (handles class imbalance) |
+| `eval_metric` | AUC |
+| `early_stopping_rounds` | 20 (stops if val AUC doesn’t improve) |
+
+### Input Format
+
+XGBoost takes the same `(N, TIMESTEPS, N_FEATURES)` sequences as BiLSTM, flattened to `(N, TIMESTEPS × N_FEATURES)` = `(N, 300)`. The same `_build_combined_dataset()` scaler and `_apply_modality_dropout_sequences()` augmentation are applied, so data preprocessing is identical.
+
+### Saved Artefacts
+
+| File | Contents |
+|---|---|
+| `apnea_model_xgb_seq.pkl` | Serialised `XGBClassifier` (pickled) |
+| `apnea_scaler_tree.pkl` | Fitted `StandardScaler` (same feature order as BiLSTM scaler) |

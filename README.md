@@ -2,7 +2,11 @@
 
 [![Repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/Sathvik-Tumati/Apnea)
 
-A multi-source, modality-aware sleep apnea detection system built on a Bidirectional LSTM (BiLSTM). The pipeline trains on two clinical datasets (MIMIC-IV and SLPDB), extracts physiological features from ECG and SpO2 signals, and runs fully automated inference on live patient recordings pulled from MongoDB — with results written to Supabase.
+A multi-source, modality-aware sleep apnea detection system that trains **two complementary models** in a single pipeline run:
+- **Modality-Aware BiLSTM** — deep sequence model with ECG/SpO2/ABP modality flags
+- **XGBoost (seq)** — gradient-boosted trees operating on the same flattened sequence features
+
+Both models train on MIMIC-IV and SLPDB with the same train/val/test split, so results are directly comparable. At inference time, both models run on each admission and their outputs are compared — disagreements are flagged for clinical review.
 
 ---
 
@@ -36,11 +40,13 @@ project2/
 │   ├── mongo_infer.py            # MongoDB → ECG+SpO2 → Sleep filter → Inference → Supabase
 │   └── ecg_sleep_filter.py       # ECG-only sleep detection (IST time gate + HRV scoring)
 ├── docs/                         # Technical documentation
-├── apnea_model.keras             # Saved trained model
-├── apnea_best.keras              # Best checkpoint (highest val AUC during training)
-├── apnea_scaler.pkl              # Fitted StandardScaler (30 features)
+├── apnea_model.keras             # BiLSTM saved model
+├── apnea_best.keras              # BiLSTM best checkpoint (highest val AUC)
+├── apnea_scaler.pkl              # BiLSTM fitted StandardScaler (30 features)
 ├── apnea_feature_cols.json       # Ordered list of the 30 feature column names
-└── apnea_thresholds.json         # Optimal thresholds {global, mimic, slpdb}
+├── apnea_thresholds.json         # BiLSTM optimal thresholds {global, mimic, slpdb}
+├── apnea_model_xgb_seq.pkl       # XGBoost sequence model (primary inference model)
+└── apnea_scaler_tree.pkl         # XGBoost StandardScaler
 ```
 
 > **Important:** Always run commands from `project2/` (the project root), not from inside `pipeline/` or `automation/`. Import paths depend on this.
@@ -54,8 +60,12 @@ This is the primary use-case. Make sure your `.env` file is set up (see [Environ
 ```bash
 source venv/bin/activate
 
-# Single admission — full pipeline (sleep filter + inference + Supabase write)
+# Single admission — full pipeline (sleep filter + dual-model inference + Supabase write)
 python automation/mongo_infer.py --admission ADM1819906487 --write-supabase
+
+# With explicit BiLSTM consensus model
+python automation/mongo_infer.py --admission ADM1819906487 --write-supabase \
+    --model-bilstm apnea_model.keras --scaler-bilstm apnea_scaler.pkl
 
 # All admissions from the last 24 hours
 python automation/mongo_infer.py --since 24h --write-supabase
@@ -78,8 +88,10 @@ python automation/mongo_infer.py --admission ADM1819906487 --write-supabase --re
 3. Pull SpO2 (1 Hz device-computed values)
 4. ECG sleep detection (IST time gate + HR/SDNN scoring) → isolate sleep epochs
 5. Build segment CSV (30 s windows, SpO2 aligned by timestamp)
-6. Run BiLSTM inference (feature extraction → scale → model → AHI proxy)
-7. Upsert results → Supabase apnea_results table
+6. Primary model inference (XGBoost) → AHI proxy
+7. Secondary model inference (BiLSTM, optional) → consensus check
+8. If both models disagree → flagged for clinical review
+9. Upsert results → Supabase apnea_results table
 ```
 
 ---
@@ -89,25 +101,33 @@ python automation/mongo_infer.py --admission ADM1819906487 --write-supabase --re
 ```bash
 source venv/bin/activate
 
-# First run — downloads MIMIC-IV + SLPDB, trains BiLSTM, saves model artefacts
+# Default: trains BOTH BiLSTM and XGBoost on MIMIC-IV + SLPDB
 python pipeline/pipeline.py --fresh --save-model
 
 # Subsequent runs reuse cached data (much faster)
 python pipeline/pipeline.py --save-model
 
+# Train only one model
+python pipeline/pipeline.py --save-model --bilstm-only
+python pipeline/pipeline.py --save-model --xgb-only
+
 # Train on specific SLPDB records only (fast iteration)
 python pipeline/pipeline.py --save-model --slpdb-records slp37 slp41 slp66
 ```
 
+> **Note:** When running `--xgb-only`, XGBoost reads segments already in `vitals_pipeline.db` from a prior BiLSTM run. If the DB is empty, run BiLSTM first or use `--fresh --save-model` (no `--xgb-only`).
+
 **Saved artefacts (in `project2/`):**
 
-| File | Contents |
-|---|---|
-| `apnea_model.keras` | Full trained BiLSTM model |
-| `apnea_best.keras` | Best val AUC checkpoint |
-| `apnea_scaler.pkl` | Fitted StandardScaler (30 features) |
-| `apnea_feature_cols.json` | Ordered feature column list |
-| `apnea_thresholds.json` | `{"global": 0.51, "mimic": 0.52, "slpdb": 0.57}` |
+| File | Model | Contents |
+|---|---|---|
+| `apnea_model.keras` | BiLSTM | Full trained BiLSTM model |
+| `apnea_best.keras` | BiLSTM | Best val AUC checkpoint |
+| `apnea_scaler.pkl` | BiLSTM | Fitted StandardScaler (30 features) |
+| `apnea_feature_cols.json` | BiLSTM | Ordered feature column list |
+| `apnea_thresholds.json` | BiLSTM | `{"global": 0.51, "mimic": 0.52, "slpdb": 0.57}` |
+| `apnea_model_xgb_seq.pkl` | XGBoost | Trained XGBClassifier (sequences flattened to T×F) |
+| `apnea_scaler_tree.pkl` | XGBoost | Fitted StandardScaler for XGBoost input |
 
 ---
 
@@ -124,10 +144,16 @@ MONGO_DB=your_database_name
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-service-role-key
 
-# Model paths (defaults shown — override if needed)
+# Primary model (XGBoost — required for inference)
 MODEL_PATH=apnea_model.keras
 SCALER_PATH=apnea_scaler.pkl
 THRESHOLD=0.45
+
+# Secondary BiLSTM model (optional — enables consensus mode)
+BILSTM_MODEL_PATH=apnea_model.keras
+BILSTM_SCALER_PATH=apnea_scaler.pkl
+
+# Output
 OUTPUT_DIR=infer_output/
 ```
 
@@ -146,12 +172,19 @@ CREATE TABLE IF NOT EXISTS apnea_results (
     processed_at      TIMESTAMPTZ,
     ahi_proxy         FLOAT,
     severity          TEXT,
+    apnea_label       TEXT,        -- 'No Apnea' | 'Mild' | 'Moderate' | 'Severe'
+    has_apnea         BOOLEAN,     -- true if ahi_proxy >= 5
     apnea_pct         FLOAT,
     total_segments    INT,
     scored_segments   INT,
     n_apnea           INT,
     duration_min      FLOAT,
-    model_threshold   FLOAT
+    model_threshold   FLOAT,
+    -- Consensus fields (populated when BiLSTM model is provided)
+    ahi_bilstm        FLOAT,
+    severity_bilstm   TEXT,
+    models_agree      BOOLEAN,
+    needs_review      BOOLEAN      -- true when XGBoost and BiLSTM disagree
 );
 ```
 
@@ -182,6 +215,7 @@ pandas
 scipy
 scikit-learn
 joblib
+xgboost        # Required for XGBoost model training and inference
 
 # Signal processing
 neurokit2     # R-peak detection (optional but strongly recommended)
@@ -198,7 +232,7 @@ python-dotenv # .env loading
 Install:
 ```bash
 source venv/bin/activate
-pip install tensorflow keras numpy pandas scipy scikit-learn joblib \
+pip install tensorflow keras numpy pandas scipy scikit-learn joblib xgboost \
             neurokit2 wfdb pymongo supabase python-dotenv
 ```
 
