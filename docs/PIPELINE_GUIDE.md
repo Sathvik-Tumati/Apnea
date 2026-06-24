@@ -32,10 +32,10 @@ MONGO_DB=your_database_name
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-service-role-key
 
-# Primary model (required for inference)
-MODEL_PATH=apnea_model.keras
-SCALER_PATH=apnea_scaler.pkl
-THRESHOLD=0.45
+# Primary model (XGBoost seq — used as --model in mongo_infer.py)
+MODEL_PATH=apnea_model_xgb_seq.pkl
+SCALER_PATH=apnea_scaler_tree.pkl
+THRESHOLD=0.55
 
 # Secondary BiLSTM model (optional — enables consensus mode)
 BILSTM_MODEL_PATH=apnea_model.keras
@@ -123,14 +123,16 @@ Each run performs these steps automatically:
 ### Commands
 
 ```bash
-# Single admission — full pipeline (XGBoost only by default)
-python automation/mongo_infer.py --admission ADM1819906487 --write-supabase
-
-# With BiLSTM consensus (both models run, disagreements flagged)
+# Single admission — XGBoost seq as primary, BiLSTM as consensus
 python automation/mongo_infer.py --admission ADM1819906487 --write-supabase \
-    --model-bilstm apnea_model.keras --scaler-bilstm apnea_scaler.pkl
+    --model apnea_model_xgb_seq.pkl \
+    --scaler apnea_scaler_tree.pkl \
+    --threshold 0.55 \
+    --model-bilstm apnea_model.keras \
+    --scaler-bilstm apnea_scaler.pkl
 
-# Or set BILSTM_MODEL_PATH + BILSTM_SCALER_PATH in .env and omit the flags
+# Or use defaults from .env (same result if MODEL_PATH set correctly)
+python automation/mongo_infer.py --admission ADM1819906487 --write-supabase
 
 # All admissions from the last 24 hours
 python automation/mongo_infer.py --since 24h --write-supabase
@@ -157,8 +159,11 @@ Under `infer_output/<admissionId>/`:
 | `ADM*_segments.csv` | Sleep-filtered, SpO2-enriched segment CSV fed to the model |
 | `ADM*_sleep_windows.csv` | Per-segment sleep scores (is_sleep, window_id, HR, SDNN, hour_ist) |
 | `infer_results_ADM*.csv` | Per-segment predictions: apnea_prob, apnea_pred, features, quality flags |
+| `infer_results_ADM*_validated.csv` | Same as above with validation score, verdict, spo2_drop_pct appended |
 | `infer_summary.csv` | One row: AHI, severity, duration_min, n_apnea, scored_segments, mean_prob |
 | `infer_summary.txt` | Human-readable clinical summary block |
+| `bilstm/infer_results_ADM*.csv` | BiLSTM per-segment predictions (consensus mode) |
+| `bilstm/infer_summary.csv` | BiLSTM summary (consensus mode) |
 
 ### Supabase Schema
 
@@ -185,11 +190,62 @@ CREATE TABLE IF NOT EXISTS apnea_results (
     models_agree      BOOLEAN,
     needs_review      BOOLEAN      -- true when XGBoost and BiLSTM disagree
 );
+
+-- Run after creating the table to add apnea_validator.py output columns:
+ALTER TABLE apnea_results
+    ADD COLUMN IF NOT EXISTS validated_ahi             FLOAT,
+    ADD COLUMN IF NOT EXISTS validation_confirmed      INT,
+    ADD COLUMN IF NOT EXISTS validation_probable       INT,
+    ADD COLUMN IF NOT EXISTS validation_uncertain      INT,
+    ADD COLUMN IF NOT EXISTS validation_unconfirmed    INT,
+    ADD COLUMN IF NOT EXISTS validation_mean_score     FLOAT,
+    ADD COLUMN IF NOT EXISTS physiologically_supported BOOLEAN;
 ```
 
 ---
 
-## 4. ECG Sleep Detection
+## 4. Post-Inference Physiological Validation
+
+`apnea_validator.py` (project root) is a rule-based second-layer verification that checks whether each model-predicted apnea event has physiological support.
+
+### How It Scores
+
+Each predicted segment is scored on four criteria:
+
+| Criterion | Max pts | What it checks |
+|---|---|---|
+| HR/RR ratio pattern | 40 | RR increases during event + HR spikes at termination |
+| SpO2 desaturation | 35 | ≥3% drop within ±2 segments (accounts for circulation lag) |
+| Respiratory suppression | 15 | EDR resp amplitude drop + elevated rate variability |
+| HR dip-surge pattern | 10 | Bradycardia during apnea → tachycardia at termination |
+
+**Verdicts:** `✓ CONFIRMED` (≥60) · `~ PROBABLE` (40–59) · `? UNCERTAIN` (20–39) · `✗ UNCONFIRMED` (<20)
+
+### Commands
+
+```bash
+# Basic validation (auto-saves _validated.csv alongside input)
+python apnea_validator.py \
+    --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv
+
+# Per-event breakdown
+python apnea_validator.py \
+    --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
+    --verbose
+
+# Explicit output path
+python apnea_validator.py \
+    --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
+    --out   infer_output/ADM1819906487/validated_results.csv
+
+# Write validation results to Supabase (requires ALTER TABLE above)
+python apnea_validator.py \
+    --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
+    --write-supabase
+```
+
+> [!NOTE]
+> The **validated AHI** counts only CONFIRMED + PROBABLE events. If it is substantially lower than the original AHI, the unconfirmed events may be artifacts or false positives from the model.
 
 The `automation/ecg_sleep_filter.py` module runs automatically inside `mongo_infer.py`. It can also be run standalone on any segment CSV produced by `--dry-run`:
 

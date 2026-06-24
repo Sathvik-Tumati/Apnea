@@ -1097,20 +1097,19 @@ def process_admission(
         logger.info("[INFER] BiLSTM paths not provided — skipping consensus")
 
     # ── Consensus ─────────────────────────────────────────────────────────────
-    xgb_normal    = (summary_xgb.get("ahi_proxy", 0) or 0) < 5.0
+    xgb_normal = (summary_xgb.get("ahi_proxy", 0) or 0) < 5.0
     if summary_bilstm:
         bilstm_normal = (summary_bilstm.get("ahi_proxy", 0) or 0) < 5.0
         models_agree  = xgb_normal == bilstm_normal
         needs_review  = not models_agree
     else:
-        bilstm_normal = None
-        models_agree  = None
-        needs_review  = False
+        models_agree = None
+        needs_review = False
 
-    summary_xgb["ahi_bilstm"]    = summary_bilstm.get("ahi_proxy") if summary_bilstm else None
-    summary_xgb["severity_bilstm"] = summary_bilstm.get("severity") if summary_bilstm else None
-    summary_xgb["models_agree"]  = models_agree
-    summary_xgb["needs_review"]  = needs_review
+    summary_xgb["ahi_bilstm"]     = summary_bilstm.get("ahi_proxy") if summary_bilstm else None
+    summary_xgb["severity_bilstm"]= summary_bilstm.get("severity") if summary_bilstm else None
+    summary_xgb["models_agree"]   = models_agree
+    summary_xgb["needs_review"]   = needs_review
 
     if models_agree is not None:
         agree_str = "✓ AGREE" if models_agree else "✗ DISAGREE — flagged for review"
@@ -1121,9 +1120,36 @@ def process_admission(
             agree_str,
         )
 
-    logger.info("[RESULT] %s  AHI=%.1f  Severity=%s  Apnea%%=%s",
-                admission_id, summary_xgb.get("ahi_proxy", 0),
-                summary_xgb.get("severity", "?"), summary_xgb.get("apnea_pct", "?"))
+    # ── Physiological validation ───────────────────────────────────────────────
+    try:
+        from apnea_validator import validate_admission
+        infer_csv = os.path.join(adm_out_dir, f"infer_results_{admission_id}.csv")
+        if os.path.exists(infer_csv):
+            logger.info("[VALIDATE] Running physiological validation ...")
+            val_result = validate_admission(
+                infer_csv    = infer_csv,
+                admission_id = admission_id,
+                verbose      = False,
+            )
+            summary_xgb["validated_ahi"]             = val_result.validated_ahi
+            summary_xgb["validation_confirmed"]      = val_result.confirmed
+            summary_xgb["validation_probable"]       = val_result.probable
+            summary_xgb["validation_uncertain"]      = val_result.uncertain
+            summary_xgb["validation_unconfirmed"]    = val_result.unconfirmed
+            summary_xgb["validation_mean_score"]     = val_result.mean_score
+            summary_xgb["physiologically_supported"] = val_result.validated_ahi >= 5.0
+        else:
+            logger.warning("[VALIDATE] infer_results CSV not found — skipping validation")
+    except Exception as e:
+        logger.warning("[VALIDATE] Skipped due to error: %s", e)
+
+    logger.info("[RESULT] %s  AHI=%.1f  Severity=%s  Apnea%%=%s  ValidatedAHI=%.1f",
+                admission_id,
+                summary_xgb.get("ahi_proxy", 0),
+                summary_xgb.get("severity", "?"),
+                summary_xgb.get("apnea_pct", "?"),
+                summary_xgb.get("validated_ahi", 0.0),
+                )
     return summary_xgb
 
 
@@ -1179,6 +1205,14 @@ def write_results_to_supabase(
         "severity_bilstm": summary.get("severity_bilstm"),
         "models_agree":    summary.get("models_agree"),
         "needs_review":    summary.get("needs_review", False),
+        # Validation fields
+        "validated_ahi":             summary.get("validated_ahi"),
+        "validation_confirmed":      summary.get("validation_confirmed"),
+        "validation_probable":       summary.get("validation_probable"),
+        "validation_uncertain":      summary.get("validation_uncertain"),
+        "validation_unconfirmed":    summary.get("validation_unconfirmed"),
+        "validation_mean_score":     summary.get("validation_mean_score"),
+        "physiologically_supported": summary.get("physiologically_supported"),
     }
     try:
         (supabase_client.table("apnea_results")
