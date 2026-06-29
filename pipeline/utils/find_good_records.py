@@ -13,11 +13,10 @@ import numpy as np
 import wfdb
 from scipy.signal import resample, welch, butter, filtfilt
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from pipeline import (
-    _load_mimic_records, _bandpass, _compute_edr, _detect_r_peaks,
-    FS_ECG, FS_RESP, SEGMENT_LEN_S,
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from pipeline.modules.ingest_mimic import _load_mimic_records
+from pipeline.modules.features import _bandpass, _compute_edr, _detect_r_peaks
+from pipeline.modules.config import FS_ECG, FS_RESP, SEGMENT_LEN_S
 
 # ── thresholds ────────────────────────────────────────────────────────────────
 ECG_SNR_MIN  = 1.5   # QRS-band SNR — below this = disconnected/noisy lead

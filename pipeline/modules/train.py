@@ -10,8 +10,6 @@ try:
     HAS_TF = True
 except ImportError:
     HAS_TF = False
-import joblib
-from scipy.signal import resample as scipy_resample
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score, classification_report
@@ -21,20 +19,8 @@ from pipeline.modules.config import (
     _SPO2_IDXS, _HAS_SPO2_IDX, _ABP_IDXS, _CROSS_IDXS, _HAS_ABP_IDX
 )
 from pipeline.modules.model import _build_model, _focal_loss
-from pipeline.modules.features import (
-    _extract_apnea_features, _bandpass, _detect_r_peaks,
-    _compute_edr, _resp_flag_edr, HAS_EDR_V3,
-)
-try:
-    from pipeline.compute_edr_fixed import compute_edr_v3 as _compute_edr_v3
-except ImportError:
-    _compute_edr_v3 = None
-from pipeline.modules.ingest_mimic import _load_mimic_records, _load_mimic_record_with_cache, HAS_WFDB
+from pipeline.modules.ingest_mimic import ingest_mimic_records
 from pipeline.modules.ingest_slpdb import ingest_slpdb_records
-from pipeline.db.database import (
-    insert_apnea_ecg_plot, insert_apnea_features,
-    insert_apnea_preprocessed, insert_apnea_raw, insert_apnea_segment,
-)
 
 _NumpyEncoder = NumpyEncoder
 logger = logging.getLogger(__name__)
@@ -167,200 +153,14 @@ def run_apnea_module(
     logger.info("  APNEA MODULE  run_id=%s  slpdb=%s", run_id, use_slpdb)
     logger.info("=" * 65)
 
-    if not HAS_WFDB:
-        logger.error("[APNEA] wfdb not installed — pip install wfdb")
-        log_module("apnea", "ingest", "failed", "wfdb not installed", 0)
-        return
 
     # ── STAGE 1: Ingest MIMIC ────────────────────────────────────────────────
-    log_module("apnea", "ingest", "started")
-    record_paths = _load_mimic_records(n_records)
-    if not record_paths:
+    mimic_rows = ingest_mimic_records(n_records=n_records, run_id=run_id)
+    total_segs = len(mimic_rows)
+
+    if total_segs == 0:
         log_module("apnea", "ingest", "failed", "No MIMIC records fetched", 0)
         return
-
-    total_segs     = 0
-    plots_per_record: Dict[str, int] = {}
-    mimic_rows: List[Dict] = []
-
-    for rec_path in record_paths:
-        record_name = rec_path.split("/")[-1]
-        pn_dir      = "mimic4wdb/0.1.0/" + "/".join(rec_path.split("/")[:-1])
-
-        # Use cached loading
-        rec = _load_mimic_record_with_cache(rec_path, pn_dir)
-        if rec is None:
-            continue
-
-        sig_map = {name: idx for idx, name in enumerate(rec.sig_name)}
-        if any(s not in sig_map for s in ["II", "Pleth"]):
-            logger.warning("[MIMIC] %s missing II or Pleth — skipping", record_name)
-            continue
-
-        signals = rec.p_signal
-        fs_orig = rec.fs
-
-        ecg_orig   = signals[:, sig_map["II"]]
-        pleth_orig = signals[:, sig_map["Pleth"]]
-        has_abp    = "ABP" in sig_map
-        abp_orig   = signals[:, sig_map["ABP"]] if has_abp else np.zeros(signals.shape[0])
-        has_gt_resp = "Resp" in sig_map
-        resp_orig   = signals[:, sig_map["Resp"]] if has_gt_resp else None
-
-        if has_gt_resp:
-            logger.info("[MIMIC] %s: GT Resp channel present", record_name)
-
-        # Fill NaNs
-        for arr in (ecg_orig, pleth_orig, abp_orig):
-            m = np.isnan(arr)
-            arr[m] = np.nanmean(arr) if not m.all() else 0.0
-        if resp_orig is not None:
-            m = np.isnan(resp_orig)
-            resp_orig[m] = np.nanmean(resp_orig) if not m.all() else 0.0
-
-        # Resample to target rates
-        ecg_full   = scipy_resample(ecg_orig,   int(len(ecg_orig)   * FS_ECG  / fs_orig))
-        pleth_full = scipy_resample(pleth_orig, int(len(pleth_orig) * FS_PPG  / fs_orig))
-        abp_full   = scipy_resample(abp_orig,   int(len(abp_orig)   * FS_ECG  / fs_orig))
-        resp_gt_full = (
-            scipy_resample(resp_orig, int(len(resp_orig) * FS_RESP / fs_orig))
-            if resp_orig is not None else None
-        )
-
-        spe = FS_ECG  * SEGMENT_LEN_S
-        spp = FS_PPG  * SEGMENT_LEN_S
-        spr = FS_RESP * SEGMENT_LEN_S
-        n_segs = min(len(ecg_full) // spe, 10)
-        if n_segs == 0:
-            continue
-
-        last_spo2_val = 97.0
-
-        # Baseline computation
-        baseline_windows: List[Dict] = []
-        for i in range(n_segs):
-            ecg_seg   = _bandpass(ecg_full[i * spe: (i+1) * spe], FS_ECG)
-            pleth_seg = pleth_full[i * spp: (i+1) * spp]
-            abp_seg   = abp_full[i * spe: (i+1) * spe]
-            rp        = _detect_r_peaks(ecg_seg, FS_ECG)
-            rr_ms     = np.diff(rp) / FS_ECG * 1000.0 if len(rp) >= 3 else np.array([833.0])
-            rmssd_w   = float(np.sqrt(np.mean(np.diff(rr_ms) ** 2))) if len(rr_ms) >= 2 else 35.0
-
-            if HAS_EDR_V3:
-                resp_seg, _, _ = _compute_edr_v3(ecg_seg, rp, FS_ECG, FS_RESP, SEGMENT_LEN_S)
-            else:
-                resp_seg = _compute_edr(ecg_seg, rp, FS_ECG, FS_RESP)
-
-            resp_gt_seg_bl = (
-                resp_gt_full[i * spr: (i+1) * spr]
-                if resp_gt_full is not None and (i+1) * spr <= len(resp_gt_full)
-                else None
-            )
-            resp_for_bl = resp_gt_seg_bl if resp_gt_seg_bl is not None else resp_seg
-            map_sig     = pd.Series(abp_seg).rolling(int(FS_ECG*2), min_periods=1).mean().values
-
-            baseline_windows.append({
-                "spo2_mean":  float(np.mean(pleth_seg)),
-                "rmssd":      rmssd_w,
-                "rr_mean":    float(np.mean(rr_ms)),
-                "map_std":    float(np.std(map_sig)),
-                "sbp_max":    float(np.max(abp_seg)),
-                "individually_clean": (
-                    not _resp_flag_edr(resp_for_bl, FS_RESP)
-                    and float(np.min(pleth_seg)) > 90.0
-                ),
-            })
-
-        clean_wins = [w for w in baseline_windows if w["individually_clean"]][:5]
-        baseline = (
-            {
-                "baseline_spo2":    float(np.mean([w["spo2_mean"] for w in clean_wins])),
-                "baseline_rmssd":   float(np.mean([w["rmssd"]     for w in clean_wins])),
-                "baseline_rr_ms":   float(np.mean([w["rr_mean"]   for w in clean_wins])),
-                "baseline_map_std": float(np.mean([w["map_std"]   for w in clean_wins])),
-                "baseline_sbp":     float(np.mean([w["sbp_max"]   for w in clean_wins])),
-            }
-            if clean_wins
-            else {
-                "baseline_spo2": 97.0, "baseline_rmssd": 35.0,
-                "baseline_rr_ms": 833.0, "baseline_map_std": 5.0, "baseline_sbp": 120.0,
-            }
-        )
-
-        # Per-segment processing
-        for i in range(n_segs):
-            ecg_seg = _bandpass(ecg_full[i * spe: (i+1) * spe], FS_ECG)
-            abp_seg = abp_full[i * spe: (i+1) * spe]
-
-            take_reading = (i % np.random.randint(6, 11)) == 0
-            if take_reading:
-                pleth_seg     = pleth_full[i * spp: (i+1) * spp]
-                last_spo2_val = float(np.mean(pleth_seg))
-            else:
-                pleth_seg = np.full(spp, last_spo2_val)
-
-            r_peaks = _detect_r_peaks(ecg_seg, FS_ECG)
-
-            if HAS_EDR_V3:
-                resp_seg, edr_bpm, edr_quality = _compute_edr_v3(
-                    ecg_seg, r_peaks, FS_ECG, FS_RESP, SEGMENT_LEN_S)
-            else:
-                resp_seg    = _compute_edr(ecg_seg, r_peaks, FS_ECG, FS_RESP)
-                edr_bpm     = None
-                edr_quality = None
-
-            resp_gt_seg = (
-                resp_gt_full[i * spr: (i+1) * spr]
-                if resp_gt_full is not None and (i+1) * spr <= len(resp_gt_full)
-                else None
-            )
-
-            raw_id = insert_apnea_raw(
-                record_name, i, ecg_seg, pleth_seg, resp_seg, abp_seg, FS_ECG)
-
-            spo2_smooth = (
-                pd.Series(pleth_seg)
-                .rolling(int(FS_PPG*2), center=True, min_periods=1)
-                .median().values            )
-            resp_smooth = (
-                pd.Series(resp_seg)
-                .rolling(FS_RESP, center=True, min_periods=1)
-                .median().values
-            )
-            rr_ms  = np.diff(r_peaks) / FS_ECG * 1000.0 if len(r_peaks) >= 2 else np.array([0.0])
-            pre_id = insert_apnea_preprocessed(
-                raw_id, ecg_seg, r_peaks, spo2_smooth, resp_smooth,
-                float(np.mean(rr_ms)), float(np.std(rr_ms)),
-                int(len(r_peaks)), float(np.median(rr_ms)),
-            )
-
-            feats = _extract_apnea_features(
-                ecg_seg, pleth_seg, resp_seg, abp_seg, r_peaks, baseline,
-                edr_bpm=edr_bpm, edr_quality=edr_quality,
-                resp_gt=resp_gt_seg, has_abp_signal=has_abp,
-            )
-            insert_apnea_features(pre_id, json.dumps(feats, cls=_NumpyEncoder))
-
-            seg_row = {"record": record_name, "segment_idx": i, "run_id": run_id, **feats}
-            insert_apnea_segment(seg_row)
-            mimic_rows.append(seg_row)
-            total_segs += 1
-
-            if plots_per_record.get(record_name, 0) < 2 and feats["true_label"] in (0, 1):
-                def _d(sig, n):
-                    return np.interp(np.linspace(0,1,n), np.linspace(0,1,len(sig)), sig)
-                insert_apnea_ecg_plot(
-                    record_name, i, ecg_seg, r_peaks,
-                    _d(spo2_smooth, SEGMENT_LEN_S),
-                    _d(resp_smooth, SEGMENT_LEN_S),
-                    _d(abp_seg, SEGMENT_LEN_S),
-                    FS_ECG, feats["true_label"], feats["label_confidence"],
-                )
-                plots_per_record[record_name] = plots_per_record.get(record_name, 0) + 1
-
-        logger.info("[MIMIC] %s: %d segments", record_name, n_segs)
-
-    log_module("apnea", "ingest", "done", "MIMIC segments ingested", total_segs)
 
     # ── STAGE 2: Ingest SLPDB ────────────────────────────────────────────────
     slpdb_rows: List[Dict] = []
