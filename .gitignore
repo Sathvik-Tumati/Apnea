@@ -72,3 +72,4 @@ feature_importance_xgb_seq.png
 # ── Legacy / moved directories ────────────────────────────────────────────────
 dashboard/
 CLI/
+converted_mongo/
