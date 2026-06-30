@@ -206,9 +206,19 @@ def detect_sleep_segments(
             return None
         sample_idx = seg_i * SAMPLES_SEG
         doc_idx = max(0, int(np.searchsorted(_cum_samples, sample_idx, side="right")) - 1)
-        if doc_idx < len(packet_timestamps):
-            return packet_timestamps[doc_idx]
-        return None
+        if doc_idx >= len(packet_timestamps):
+            return None
+        base_ts = packet_timestamps[doc_idx]
+        if base_ts is None:
+            return None
+        # Compute the actual segment start by offsetting within the document.
+        # Returning only the document timestamp (old behaviour) introduced up to
+        # ~minutes of timestamp error near 9 pm / 9 am IST gate boundaries.
+        intra_offset_s = (sample_idx - _cum_samples[doc_idx]) / FS_ECG
+        try:
+            return base_ts + pd.Timedelta(seconds=intra_offset_s)
+        except Exception:
+            return base_ts  # graceful fallback to doc timestamp
 
     # ── Per-segment HRV features ──────────────────────────────────────────────
     rows = []
@@ -223,8 +233,10 @@ def detect_sleep_segments(
         hour_ist = -1
         try:
             if ts is not None:
-                ts_ist = (pd.Timestamp(ts).tz_localize("UTC") if ts.tzinfo is None
-                          else pd.Timestamp(ts).tz_convert("Asia/Kolkata"))
+                ts_base = pd.Timestamp(ts)
+                if ts_base.tzinfo is None:
+                    ts_base = ts_base.tz_localize("UTC")
+                ts_ist = ts_base.tz_convert("Asia/Kolkata")
                 hour_ist = ts_ist.hour
         except Exception:
             pass
@@ -311,12 +323,27 @@ def detect_sleep_segments(
     # Require score ≥ 0.5 (at least one HRV criterion met, within time window)
     is_sleep = (score_smooth >= 0.50).astype(int)
     
-    # BUG FIX: Apply hard clamp HERE, after is_sleep exists and before run-length processing
+    # Hard clamp BEFORE run-length processing: daytime segments start as 0
+    # so _fill_short_gaps cannot count them as candidates to bridge.
     if use_time_gate:
         is_sleep[~df["in_sleep_hours"].values] = 0
 
     is_sleep = _fill_short_gaps(is_sleep, gap=gap_epochs)
     is_sleep = _remove_short_bouts(is_sleep, min_run=min_epochs)
+
+    # Hard clamp AGAIN after run-length processing: _fill_short_gaps can re-bridge
+    # daytime segments that sit between two sleep bouts. This second clamp is the
+    # authoritative gate — no daytime segment (in_sleep_hours=False) can ever be
+    # is_sleep=1, regardless of its neighbours.
+    if use_time_gate:
+        n_reclamped = int(is_sleep[~df["in_sleep_hours"].values].sum())
+        if n_reclamped:
+            logger.info(
+                "[SLEEP] Post-bridge clamp: zeroing %d daytime segments "
+                "that were re-bridged by _fill_short_gaps", n_reclamped
+            )
+        is_sleep[~df["in_sleep_hours"].values] = 0
+
     df["is_sleep"] = is_sleep
 
     # ── Assign sleep window IDs ───────────────────────────────────────────────

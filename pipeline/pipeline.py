@@ -187,12 +187,11 @@ def _train_xgboost(save_model: bool, skip_slpdb: bool, slpdb_records) -> None:
 
         logger.info("[XGB] Saved → %s", xgb_path)
         logger.info("[XGB] Saved → %s", scaler_path)
-        
-        # ── Testing: reload and verify ──────────────────────────────────────
+
+        # ── Verify: reload and validate ─────────────────────────────────────
         logger.info("[XGB] Testing reload of saved model...")
         with open(scaler_path, "rb") as f:
             scaler_reloaded = pickle.load(f)
-        # Use scaler_reloaded for testing if needed
         logger.info("[XGB] Scaler reloaded successfully")
     else:
         logger.info("[XGB] --save-model not set — models not saved to disk")

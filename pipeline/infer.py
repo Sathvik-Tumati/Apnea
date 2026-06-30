@@ -426,10 +426,12 @@ def _recording_duration_min(adm_df: pd.DataFrame, n_segs: int) -> float:
     Return recording duration in minutes.
 
     Prefer actual first/last timestamps from the DataFrame — this correctly
-    accounts for packet gaps that would otherwise inflate AHI when using
-    n_segs × 30s as the denominator.
+    accounts for packet gaps that would otherwise DEFLATE AHI when using
+    n_segs × 30s as the denominator (gap recordings have wall_min > scored_min).
 
-    Falls back to n_segs × 30s if timestamps are absent or unparseable.
+    Falls back to n_segs × 30s only when timestamps are clearly wrong:
+      - too_short: wall_min < 90% of scored_min (clock skew / corrupt timestamps)
+      - too_long:  wall_min > 1440 min = 24 h (impossible for one admission)
     """
     ts_col = "timestamp"
     if ts_col not in adm_df.columns:
@@ -439,21 +441,28 @@ def _recording_duration_min(adm_df: pd.DataFrame, n_segs: int) -> float:
     if len(ts) < 2:
         return n_segs * SEGMENT_LEN_S / 60.0
 
-    wall_min = (ts.max() - ts.min()).total_seconds() / 60.0
-
-    # Sanity check: wall time should be ≥ scored time and ≤ 24 h
+    wall_min   = (ts.max() - ts.min()).total_seconds() / 60.0
     scored_min = n_segs * SEGMENT_LEN_S / 60.0
-    if wall_min < scored_min or wall_min > 1440:
+
+    # wall_min >= scored_min is EXPECTED when there are recording gaps.
+    # Only reject timestamps that are clearly impossible:
+    too_short = wall_min < scored_min * 0.90   # >10% shorter than scored → corrupt
+    too_long  = wall_min > 1440.0              # >24h is impossible for one admission
+
+    if too_short or too_long:
         logger.warning(
-            "[AHI] Timestamp-derived duration %.1f min looks wrong "
-            "(scored=%.1f min) — falling back to segment count.",
-            wall_min, scored_min,
+            "[AHI] Timestamp-derived duration %.1f min rejected "
+            "(scored=%.1f min, too_short=%s, too_long=%s) — "
+            "falling back to segment count.",
+            wall_min, scored_min, too_short, too_long,
         )
         return scored_min
 
-    logger.info("[AHI] Duration from timestamps: %.1f min  "
-                "(segment-count estimate was %.1f min)",
-                wall_min, scored_min)
+    logger.info(
+        "[AHI] Duration from timestamps: %.1f min  "
+        "(segment-count estimate was %.1f min, recording gap = %.1f min)",
+        wall_min, scored_min, max(0.0, wall_min - scored_min),
+    )
     return wall_min
 
 
@@ -660,6 +669,8 @@ def _run_one_admission(
         "n_normal":         n_scored - n_apnea,
         "apnea_pct":        round(apnea_pct, 1),
         "mean_apnea_prob":  round(mean_prob, 3),
+        "max_apnea_prob":   round(float(np.nanmax(prob_col)), 3) if n_scored > 0 else 0.0,
+        "min_apnea_prob":   round(float(np.nanmin(prob_col[~np.isnan(prob_col)])), 3) if n_scored > 0 else 0.0,
         "ahi_proxy":        round(ahi_proxy, 1),
         "severity":         severity,
         "duration_min":     round(dur_min, 1),

@@ -363,11 +363,25 @@ def _extract_apnea_features(
     desat_thresh                = baseline.get("baseline_spo2", 97.0) - 3.0
     feats["odi"]                = float(np.sum(np.diff((smooth < desat_thresh).astype(int)) == 1))
     feats["t90"]                = float(np.mean(smooth < 90.0))
-    try:
-        phi = (smooth - np.mean(smooth)) / (np.std(smooth) + 1e-9)
-        feats["spo2_approx_entropy"] = float(-np.mean(np.log(np.abs(np.diff(phi)) + 1e-9)))
-    except Exception:
-        feats["spo2_approx_entropy"] = 0.0
+    # spo2_approx_entropy: Pincus ApEn — same computation as mongo_infer.py
+    # (the previous formula used log-mean-abs-derivative which is always
+    # negative, while production uses true ApEn which is always positive;
+    # the sign mismatch caused the scaler to invert this feature's direction)
+    def _apen(sig: np.ndarray, m: int = 2, r_factor: float = 0.2) -> float:
+        n  = len(sig)
+        sd = float(np.std(sig))
+        if n < 2 * m + 2 or sd < 1e-9:
+            return 0.0
+        r = r_factor * sd
+        def _phi(mv: int) -> float:
+            templates = np.array([sig[i:i + mv] for i in range(n - mv + 1)])
+            count = np.sum(
+                np.max(np.abs(templates[:, None, :] - templates[None, :, :]), axis=2) <= r,
+                axis=1,
+            )
+            return float(np.mean(np.log(count / (n - mv + 1) + 1e-10)))
+        return abs(_phi(m) - _phi(m + 1))
+    feats["spo2_approx_entropy"] = _apen(smooth)
 
     # ── Respiratory features ──────────────────────────────────────────────────
     feats["resp_amplitude_mean"] = float(np.mean(np.abs(resp_for_feats)))

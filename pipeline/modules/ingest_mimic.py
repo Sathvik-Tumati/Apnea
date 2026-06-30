@@ -291,7 +291,10 @@ def _process_mimic_record(
         if resp_orig is not None else None
     )
 
-    n_segs = min(len(ecg_full) // spe, 10)
+    # Cap raised from 10 to 60: with TIMESTEPS=10, a cap of 10 produced at most
+    # 1 usable training sequence per MIMIC record (segments 0-9 → predict seg 9 only).
+    # At 60 segments per record we get up to 50 sequences per record.
+    n_segs = min(len(ecg_full) // spe, 60)
     if n_segs == 0:
         return []
 
@@ -308,13 +311,11 @@ def _process_mimic_record(
         ecg_seg = _bandpass(ecg_full[i * spe: (i + 1) * spe], FS_ECG)
         abp_seg = abp_full[i * spe: (i + 1) * spe]
 
-        # Simulate intermittent SpO2 readings (as on real monitors)
-        take_reading = (i % np.random.randint(6, 11)) == 0
-        if take_reading:
-            pleth_seg     = pleth_full[i * spp: (i + 1) * spp]
-            last_spo2_val = float(np.mean(pleth_seg))
-        else:
-            pleth_seg = np.full(spp, last_spo2_val)
+        # Always use real pleth for all segments.
+        # Holding the signal constant (old behaviour) produced spo2_delta_index=0,
+        # spo2_approx_entropy=0, odi=0 for ~85% of training segments, so the model
+        # never saw what a live 1 Hz SpO2 stream looks like.
+        pleth_seg = pleth_full[i * spp: (i + 1) * spp]
 
         r_peaks = _detect_r_peaks(ecg_seg, FS_ECG)
 
