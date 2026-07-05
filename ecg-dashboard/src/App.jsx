@@ -11,7 +11,7 @@ import './index.css';
 export default function App() {
   const [tab, setTab] = useState(0);
   const [selSeg, setSelSeg] = useState(0);
-  const [raw, setRaw] = useState({ segments: null, ecgMap: null, inferXgb: null, inferBL: null, sleepWindows: null, summary: null });
+  const [raw, setRaw] = useState({ segments: null, ecgMap: null, inferXgb: null, sleepWindows: null, summary: null });
   
   const [st, setSt] = useState({});
   const [pg, setPg] = useState({});
@@ -21,7 +21,6 @@ export default function App() {
       const next = { ...prev };
       if (key === 'segments') { next.segments = result.rows; next.ecgMap = result.ecgMap; }
       else if (key === 'inferXgb') next.inferXgb = result.rows;
-      else if (key === 'inferBL') next.inferBL = result.rows;
       else if (key === 'sleep') next.sleepWindows = result.rows;
       else if (key === 'summary') next.summary = result.rows?.[0];
       return next;
@@ -56,11 +55,6 @@ export default function App() {
     });
   }, [handle]);
 
-  const blMap = useMemo(() => {
-    if (!raw.inferBL) return new Map();
-    return new Map(raw.inferBL.map(r => [+r.segment_idx, r]));
-  }, [raw.inferBL]);
-
   const sleepMap = useMemo(() => {
     if (!raw.sleepWindows) return new Map();
     return new Map(raw.sleepWindows.map(r => [+r.segment_idx, r]));
@@ -68,13 +62,9 @@ export default function App() {
 
   const merged = useMemo(() => {
     if (!raw.inferXgb) return null;
-    return raw.inferXgb.map(r => {
-      const b = blMap.get(+r.segment_idx);
-      return { ...r, bilstm_prob: b?.apnea_prob, bilstm_pred: b?.apnea_pred };
-    });
-  }, [raw.inferXgb, blMap]);
+    return raw.inferXgb;
+  }, [raw.inferXgb]);
 
-  const hasBL = !!raw.inferBL;
   const admId = merged?.[0]?.admission_id || raw.summary?.admission_id || null;
 
   return (
@@ -100,11 +90,11 @@ export default function App() {
       <TabBar active={tab} onSelect={setTab} />
 
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        {tab === 0 && <OverviewTab merged={merged} summary={raw.summary} sleepMap={sleepMap} hasBL={hasBL} onSel={setSelSeg} onTab={setTab} />}
+        {tab === 0 && <OverviewTab merged={merged} summary={raw.summary} sleepMap={sleepMap} onSel={setSelSeg} onTab={setTab} />}
         {tab === 1 && <ECGViewerTab merged={merged} ecgMap={raw.ecgMap} spo2Map={raw.spo2Map} selSeg={selSeg} onSel={setSelSeg} />}
         {tab === 2 && <SleepTab sleepWindows={raw.sleepWindows} onSel={setSelSeg} onTab={setTab} />}
-        {tab === 3 && <ModelsTab merged={merged} hasBL={hasBL} onSel={setSelSeg} onTab={setTab} />}
-        {tab === 4 && <SegTable merged={merged} hasBL={hasBL} onSel={setSelSeg} onTab={setTab} />}
+        {tab === 3 && <ModelsTab merged={merged} onSel={setSelSeg} onTab={setTab} />}
+        {tab === 4 && <SegTable merged={merged} onSel={setSelSeg} onTab={setTab} />}
       </div>
     </div>
   );

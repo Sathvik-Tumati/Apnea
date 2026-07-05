@@ -1,13 +1,8 @@
 """
 pipeline/pipeline.py
 ====================
-Multi-source apnea detection pipeline.
-Trains both:
-  1. Modality-aware BiLSTM  (apnea_model.keras + apnea_scaler.pkl)
-  2. XGBoost (seq)          (apnea_model_xgb_seq.pkl + apnea_scaler_tree.pkl)
-
-Both models are trained on the same MIMIC-IV + SLPDB data and the same
-train/val/test split so results are directly comparable.
+Apnea detection training pipeline.
+Trains XGBoost (seq) on MIMIC-IV + SLPDB data.
 
 Usage
 -----
@@ -16,7 +11,6 @@ Usage
   python pipeline/pipeline.py --save-model
   python pipeline/pipeline.py --no-slpdb
   python pipeline/pipeline.py --slpdb-records slp37 slp41 slp66
-  python pipeline/pipeline.py --save-model --bilstm-only
   python pipeline/pipeline.py --save-model --xgb-only
 """
 
@@ -26,7 +20,6 @@ import pickle
 import sys
 from pathlib import Path
 import warnings
-import tensorflow as tf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -54,16 +47,14 @@ def _parse_args() -> argparse.Namespace:
                         help="Skip SLPDB completely.")
     parser.add_argument("--slpdb-records",  nargs="+",
                         help="Specific SLPDB records to ingest (e.g. slp01a slp66)")
-    parser.add_argument("--bilstm-only",    action="store_true",
-                        help="Train BiLSTM only, skip XGBoost.")
     parser.add_argument("--xgb-only",       action="store_true",
-                        help="Train XGBoost only, skip BiLSTM.")
+                        help="Reserved flag — XGBoost is the only model and always runs.")
     return parser.parse_args()
 
 
 def _train_xgboost(save_model: bool, skip_slpdb: bool, slpdb_records) -> None:
     """
-    Train XGBoost (seq) on the same data as the BiLSTM and optionally save.
+    Train XGBoost (seq) on MIMIC-IV + SLPDB data and optionally save.
     Reuses _build_combined_dataset so the scaler and split are identical.
     """
     try:
@@ -82,7 +73,7 @@ def _train_xgboost(save_model: bool, skip_slpdb: bool, slpdb_records) -> None:
     # ── Load data ─────────────────────────────────────────────────────────────
     seg_df = fetch_apnea_segments()
     if seg_df is None or len(seg_df) == 0:
-        logger.error("[XGB] No segments in DB — run BiLSTM first or use --fresh")
+        logger.error("[XGB] No segments in DB — use --fresh to repopulate from source data")
         return
 
     if not isinstance(seg_df, pd.DataFrame):
@@ -111,7 +102,7 @@ def _train_xgboost(save_model: bool, skip_slpdb: bool, slpdb_records) -> None:
     X_seq, y_seq   = _build_sequences(X_flat, y_all, TIMESTEPS)
     _, src_seq     = _build_sequences(X_flat, src_all, TIMESTEPS)
 
-    # ── Same stratified split as BiLSTM (random_state=42) ────────────────────
+    # ── Consistent stratified split (random_state=42) ────────────────────
     X_tr_val, X_te, y_tr_val, y_te, src_tr_val, src_te = train_test_split(
         X_seq, y_seq, src_seq,
         test_size=0.20, stratify=y_seq, random_state=42)
@@ -217,37 +208,23 @@ def main():
 
     init_db()
 
-    # ── BiLSTM ────────────────────────────────────────────────────────────────
-    if not args.xgb_only:
-        logger.info("[PIPELINE] ── Training BiLSTM ──────────────────────────")
-        run_apnea_module(
-            save_model    = args.save_model,
-            skip_slpdb    = args.no_slpdb,
-            slpdb_records = args.slpdb_records,
-        )
-    else:
-        logger.info("[PIPELINE] Skipping BiLSTM (--xgb-only)")
+    # ── Data ingestion (populates vitals_pipeline.db for XGBoost) ────────────
+    run_apnea_module(
+        save_model    = False,      # No model to save from this stage — XGB saves its own
+        skip_slpdb    = args.no_slpdb,
+        slpdb_records = args.slpdb_records,
+    )
 
     # ── XGBoost ───────────────────────────────────────────────────────────────
-    if not args.bilstm_only:
-        logger.info("[PIPELINE] ── Training XGBoost ─────────────────────────")
-        _train_xgboost(
-            save_model    = args.save_model,
-            skip_slpdb    = args.no_slpdb,
-            slpdb_records = args.slpdb_records,
-        )
-    else:
-        logger.info("[PIPELINE] Skipping XGBoost (--bilstm-only)")
+    logger.info("[PIPELINE] ── Training XGBoost ─────────────────────────")
+    _train_xgboost(
+        save_model    = args.save_model,
+        skip_slpdb    = args.no_slpdb,
+        slpdb_records = args.slpdb_records,
+    )
 
     logger.info("[PIPELINE] All done.")
 
 
 if __name__ == "__main__":
-    try:
-        physical_devices = tf.config.list_physical_devices('GPU')
-        for d in physical_devices:
-            tf.config.experimental.set_memory_growth(d, True)
-    except Exception:
-        pass
-
     main()

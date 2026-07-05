@@ -65,12 +65,12 @@ If only ECG is available (most wearables), it falls back to HR-based sleep scori
 ## Step 3: Run Inference
 
 ```bash
-# Full BiLSTM inference
+# Full XGBoost inference
 python pipeline/edf_test_loader.py \
     --data pipeline/converted/sleep_only/ \
     --mode infer \
-    --model apnea_model.keras \
-    --scaler apnea_scaler.pkl \
+    --model apnea_model_xgb_seq.pkl \
+    --scaler apnea_scaler_tree.pkl \
     --features apnea_feature_cols.json
 
 # Feature extraction only (no model)
@@ -83,7 +83,7 @@ python pipeline/edf_test_loader.py \
 The script will:
 - Detect that SpO2/ABP/GT_Resp are missing, set modality flags to 0
 - Use the dual-engine EDR algorithm for respiratory features
-- Run the Modality-Aware BiLSTM with the appropriate flags
+- Run the XGBoost model with the extracted sequence features
 - Output a per-segment probability sequence and clinical summary
 
 ---

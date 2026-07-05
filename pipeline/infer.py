@@ -896,7 +896,7 @@ def run_inference(
             logger.error("%s not found: '%s' — run pipeline.py --save-model", label, path)
             return
 
-    # ── MODEL LOADING (supports both Keras .keras and XGBoost .pkl) ─────────
+    # ── MODEL LOADING (XGBoost .pkl) ─────────────────────────────────────────
     logger.info("Loading model from %s", model_path)
     try:
         if model_path.endswith(".pkl"):
@@ -906,12 +906,11 @@ def run_inference(
             model_type = "xgboost"
             logger.info("Model type: XGBoost (tree-based)")
         else:
-            # Keras BiLSTM
-            import tensorflow as tf
-            from pipeline.modules.model import GatherFlags
-            model = tf.keras.models.load_model(model_path, compile=False)
-            model_type = "keras"
-            logger.info("Model type: Keras (BiLSTM)")
+            logger.error(
+                "Unsupported model format: '%s'. Only .pkl (XGBoost) is supported.",
+                model_path,
+            )
+            return
     except Exception as exc:
         logger.error("Failed to load model: %s", exc)
         return

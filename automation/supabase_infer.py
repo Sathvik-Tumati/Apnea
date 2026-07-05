@@ -108,16 +108,8 @@ RESULTS_TABLE = os.environ.get("RESULTS_TABLE", "apnea_results")
 # Supabase REST caps page size; paginate in chunks of this size
 PAGE_SIZE = 1000
 
-# ── Dual-model config ─────────────────────────────────────────────────────────
-# IMPORTANT: per pipeline.py, the two trained model pairs are:
-#   BiLSTM   → apnea_model.keras          + apnea_scaler.pkl
-#   XGBoost  → apnea_model_xgb_seq.pkl    + apnea_scaler_tree.pkl
-# These defaults previously both pointed at the *same* .keras/.pkl pair
-# (a leftover collision), which meant the "XGBoost" slot silently loaded
-# the BiLSTM model instead, and apnea_model_xgb_seq.pkl was never used.
 # Do not let these two pairs default to the same path again.
-BILSTM_MODEL_PATH  = os.environ.get("BILSTM_MODEL_PATH",  "apnea_model.keras")
-BILSTM_SCALER_PATH = os.environ.get("BILSTM_SCALER_PATH", "apnea_scaler.pkl")
+
 
 # ── Pipeline constants ────────────────────────────────────────────────────────
 FS_ECG               = 125
@@ -894,9 +886,6 @@ def process_admission(
     output_dir:        str,
     dry_run:           bool = False,
     no_sleep_filter:   bool = False,
-    bilstm_model_path: Optional[str] = None,
-    bilstm_scaler_path: Optional[str] = None,
-    threshold_bilstm:  Optional[float] = None,
 ) -> Optional[Dict]:
     logger.info("=" * 60)
     logger.info("  Processing: %s", admission_id)
@@ -974,54 +963,9 @@ def process_admission(
     )
     if not summary_xgb:
         logger.error("[INFER] XGBoost model failed for %s", admission_id)
-
-    # ── Model 2 inference (BiLSTM) ────────────────────────────────────────────
-    summary_bilstm = None
-    run_bilstm = (
-        bilstm_model_path and bilstm_scaler_path
-        and os.path.exists(bilstm_model_path)
-        and os.path.exists(bilstm_scaler_path)
-    )
-    if run_bilstm:
-        logger.info("[INFER] Running BiLSTM ...")
-        bilstm_out_dir = os.path.join(adm_out_dir, "bilstm")
-        os.makedirs(bilstm_out_dir, exist_ok=True)
-        bilstm_thresh = threshold_bilstm if threshold_bilstm is not None else threshold
-        summary_bilstm = run_inference_on_csv(
-            csv_path=csv_path, model_path=bilstm_model_path,
-            scaler_path=bilstm_scaler_path, threshold=bilstm_thresh,
-            out_dir=bilstm_out_dir, admission_id=admission_id,
-        )
-        if summary_bilstm:
-            logger.info("[INFER] BiLSTM  AHI=%.1f  Severity=%s",
-                        summary_bilstm.get("ahi_proxy", 0),
-                        summary_bilstm.get("severity", "?"))
-        else:
-            logger.warning("[INFER] BiLSTM inference failed")
-    else:
-        logger.info("[INFER] BiLSTM paths not provided — skipping")
-
-    if not summary_xgb and not summary_bilstm:
-        logger.error("[INFER] Both models failed for %s", admission_id)
         return None
 
-    summary = summary_xgb.copy() if summary_xgb else summary_bilstm.copy()
-
-    if summary_xgb:
-        summary["ahi_proxy"] = summary_xgb.get("ahi_proxy")
-        summary["severity"]  = summary_xgb.get("severity")
-        summary["apnea_pct"] = summary_xgb.get("apnea_pct")
-    else:
-        summary["ahi_proxy"] = None
-        summary["severity"]  = None
-        summary["apnea_pct"] = None
-
-    if summary_bilstm:
-        summary["ahi_bilstm"]      = summary_bilstm.get("ahi_proxy")
-        summary["severity_bilstm"] = summary_bilstm.get("severity")
-    else:
-        summary["ahi_bilstm"]      = None
-        summary["severity_bilstm"] = None
+    summary = summary_xgb.copy()
 
     # ── Physiological validation ───────────────────────────────────────────────
     try:
@@ -1046,10 +990,9 @@ def process_admission(
     except Exception as e:
         logger.warning("[VALIDATE] Skipped due to error: %s", e)
 
-    logger.info("[RESULT] %s  XGB_AHI=%s  BiLSTM_AHI=%s  ValidatedAHI=%s",
+    logger.info("[RESULT] %s  XGB_AHI=%s  ValidatedAHI=%s",
                 admission_id,
                 f"{summary.get('ahi_proxy'):.1f}" if summary.get("ahi_proxy") is not None else "N/A",
-                f"{summary.get('ahi_bilstm'):.1f}" if summary.get("ahi_bilstm") is not None else "N/A",
                 f"{summary.get('validated_ahi'):.1f}" if summary.get("validated_ahi") is not None else "N/A",
                 )
 
@@ -1060,9 +1003,6 @@ def process_admission(
     if summary_xgb:
         xgb_csv = os.path.join(adm_out_dir, f"infer_results_{admission_id}.csv")
         events.extend(extract_apnea_events(xgb_csv, admission_id, "xgboost"))
-    if summary_bilstm:
-        bilstm_csv = os.path.join(adm_out_dir, "bilstm", f"infer_results_{admission_id}.csv")
-        events.extend(extract_apnea_events(bilstm_csv, admission_id, "bilstm"))
     summary["_apnea_events"] = events
 
     return summary
@@ -1105,7 +1045,7 @@ def get_existing_result(supabase_client, admission_id: str) -> Optional[Dict]:
 #   CREATE TABLE apnea_events (
 #       id BIGSERIAL PRIMARY KEY,
 #       admission_id TEXT NOT NULL REFERENCES apnea_results(admission_id),
-#       model_source TEXT NOT NULL,        -- 'xgboost' or 'bilstm'
+#       model_source TEXT NOT NULL,        -- 'xgboost'
 #       segment_idx INTEGER NOT NULL,
 #       event_timestamp TIMESTAMPTZ,
 #       apnea_prob REAL,
@@ -1229,8 +1169,6 @@ def write_results_to_supabase(
         "n_apnea":         summary.get("n_apnea"),
         "duration_min":    summary.get("duration_min"),
         "model_threshold": summary.get("threshold"),
-        "ahi_bilstm":      summary.get("ahi_bilstm"),
-        "severity_bilstm": summary.get("severity_bilstm"),
         "validated_ahi":             summary.get("validated_ahi"),
         "validation_confirmed":      summary.get("validation_confirmed"),
         "validation_probable":       summary.get("validation_probable"),
@@ -1245,10 +1183,9 @@ def write_results_to_supabase(
         (supabase_client.table(RESULTS_TABLE)
          .upsert(record, on_conflict="admission_id")
          .execute())
-        logger.info("[SUPABASE] Upserted %s (XGB_AHI=%s, BiLSTM_AHI=%s)",
+        logger.info("[SUPABASE] Upserted %s (XGB_AHI=%s)",
                     admission_id,
-                    f"{ahi:.1f}" if ahi is not None else "N/A",
-                    f"{summary.get('ahi_bilstm'):.1f}" if summary.get("ahi_bilstm") is not None else "N/A")
+                    f"{ahi:.1f}" if ahi is not None else "N/A")
     except Exception as e:
         logger.error("[SUPABASE] Failed for %s: %s", admission_id, e)
 
@@ -1262,10 +1199,6 @@ def _parse_args() -> argparse.Namespace:
         description="Supabase → ECG+SpO2 → Apnea inference → Supabase",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--model-bilstm",  default=os.environ.get("BILSTM_MODEL_PATH",  "apnea_model.keras"),
-               help="Path to BiLSTM .keras for consensus (optional)")
-    p.add_argument("--scaler-bilstm", default=os.environ.get("BILSTM_SCALER_PATH", "apnea_scaler.pkl"),
-               help="Path to BiLSTM scaler for consensus (optional)")
     p.add_argument("--admission",       default=None)
     p.add_argument("--since",           default=None,
                    help="Last N hours, e.g. 24h")
@@ -1274,11 +1207,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--to",              dest="date_to",   default=None,
                    help="End date YYYY-MM-DD")
     p.add_argument("--model",           default=os.environ.get("MODEL_PATH",  "apnea_model_xgb_seq.pkl"),
-               help="Path to the XGBoost (seq) model — must be the .pkl from pipeline.py, not the BiLSTM .keras")
+               help="Path to the XGBoost (seq) model — must be the .pkl from pipeline.py")
     p.add_argument("--scaler",          default=os.environ.get("SCALER_PATH", "apnea_scaler_tree.pkl"),
-               help="Path to the XGBoost tree scaler — apnea_scaler_tree.pkl, not apnea_scaler.pkl")
-    p.add_argument("--threshold-bilstm", type=float, default=None,
-               help="Optional separate threshold for the BiLSTM model. Defaults to --threshold.")
+               help="Path to the XGBoost tree scaler")
     p.add_argument("--threshold",       type=float,
                    default=float(os.environ.get("THRESHOLD", "0.45")))
     p.add_argument("--out-dir",         default=os.environ.get("OUTPUT_DIR",  "infer_output"))
@@ -1325,36 +1256,11 @@ def main() -> None:
 
     client = get_supabase_client()
 
-    # ── Guard against the exact bug that caused XGB/BiLSTM results to swap ────
-    # Refuse to run if the "XGBoost" and "BiLSTM" slots point at the same file,
-    # or if either points at a file with the wrong extension for its role.
-    if os.path.abspath(args.model) == os.path.abspath(args.model_bilstm):
-        logger.error(
-            "[SETUP] --model and --model-bilstm resolve to the same file (%s). "
-            "This previously caused the BiLSTM model to silently run twice "
-            "while apnea_model_xgb_seq.pkl was never loaded. Refusing to run — "
-            "set MODEL_PATH=apnea_model_xgb_seq.pkl and "
-            "BILSTM_MODEL_PATH=apnea_model.keras explicitly.", args.model)
-        sys.exit(1)
-    if os.path.abspath(args.scaler) == os.path.abspath(args.scaler_bilstm):
-        logger.error(
-            "[SETUP] --scaler and --scaler-bilstm resolve to the same file (%s). "
-            "Set SCALER_PATH=apnea_scaler_tree.pkl and "
-            "BILSTM_SCALER_PATH=apnea_scaler.pkl explicitly.", args.scaler)
-        sys.exit(1)
     if not args.model.endswith(".pkl"):
         logger.warning(
-            "[SETUP] --model (XGBoost slot) is '%s', which doesn't end in .pkl. "
+            "[SETUP] --model is '%s', which doesn't end in .pkl. "
             "infer.py routes by extension — a non-.pkl path here will be loaded "
             "as a Keras model instead of XGBoost.", args.model)
-    if not args.model_bilstm.endswith(".keras"):
-        logger.warning(
-            "[SETUP] --model-bilstm is '%s', which doesn't end in .keras. "
-            "infer.py routes by extension — a .pkl path here will be loaded "
-            "as an XGBoost/tree model instead of the BiLSTM.", args.model_bilstm)
-
-    threshold_bilstm = (args.threshold_bilstm if args.threshold_bilstm is not None
-                        else args.threshold)
 
     # ── Resolve admissions ────────────────────────────────────────────────────
     if args.admission:
@@ -1402,9 +1308,6 @@ def main() -> None:
                 threshold=args.threshold, output_dir=args.out_dir,
                 dry_run=args.dry_run,
                 no_sleep_filter=args.no_sleep_filter,
-                bilstm_model_path=args.model_bilstm,
-                bilstm_scaler_path=args.scaler_bilstm,
-                threshold_bilstm=threshold_bilstm,
             )
             if summary:
                 successes += 1

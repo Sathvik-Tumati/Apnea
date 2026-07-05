@@ -396,7 +396,7 @@ def _write_report(metrics: Dict, out_dir: str) -> None:
     lines = [
         "=" * 62,
         "  SLPDB APNEA MODEL EVALUATION REPORT",
-        "  (Modality-aware BiLSTM — ECG-only inference path)",
+        "  (XGBoost — ECG-only inference path)",
         "=" * 62,
         "",
         f"  Records evaluated  : {metrics['n_records']}",
@@ -448,7 +448,8 @@ def _write_report(metrics: Dict, out_dir: str) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_evaluation(
-    model_path:   str        = "apnea_model.keras",
+    model_path:   str        = "apnea_model_xgb_seq.pkl",
+
     scaler_path:  str        = "apnea_scaler.pkl",
     out_dir:      str        = "slpdb_eval_output",
     records:      List[str]  = None,
@@ -570,7 +571,8 @@ Examples
   python evaluate_on_slpdb.py --model custom_model.keras --scaler custom_scaler.pkl
         """
     )
-    p.add_argument("--model",        default="apnea_model.keras")
+    p.add_argument("--model",        default="apnea_model_xgb_seq.pkl")
+
     p.add_argument("--scaler",       default="apnea_scaler.pkl")
     p.add_argument("--out-dir",      default="slpdb_eval_output")
     p.add_argument("--records",      nargs="+", default=None)

@@ -2,7 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { Empty } from './Shared';
 import { toISTShort } from '../utils/format';
 
-export function SegTable({ merged, hasBL, onSel, onTab }) {
+export function SegTable({ merged, onSel, onTab }) {
   const [pg, setPg] = useState(0);
   const [sf, setSf] = useState('all');
   
@@ -10,8 +10,6 @@ export function SegTable({ merged, hasBL, onSel, onTab }) {
     if (!merged) return [];
     if (sf === 'all') return merged;
     if (sf === 'apneaX') return merged.filter(r => r.apnea_pred === 1);
-    if (sf === 'apneaB') return merged.filter(r => r.bilstm_pred === 1);
-    if (sf === 'disagree') return merged.filter(r => r.bilstm_pred != null && r.apnea_pred !== r.bilstm_pred);
     if (sf === 'flag') return merged.filter(r => r.hr_gate_pass === 0);
     return merged;
   }, [merged, sf]);
@@ -53,8 +51,6 @@ export function SegTable({ merged, hasBL, onSel, onTab }) {
         >
           <option value="all">All {merged.length} segments</option>
           <option value="apneaX">XGBoost Apnea ({merged.filter(r => r.apnea_pred === 1).length})</option>
-          {hasBL && <option value="apneaB">BiLSTM Apnea ({merged.filter(r => r.bilstm_pred === 1).length})</option>}
-          {hasBL && <option value="disagree">Disagreements ({merged.filter(r => r.bilstm_pred != null && r.apnea_pred !== r.bilstm_pred).length})</option>}
           <option value="flag">Flagged/Excluded ({merged.filter(r => r.hr_gate_pass === 0).length})</option>
         </select>
         
@@ -73,7 +69,6 @@ export function SegTable({ merged, hasBL, onSel, onTab }) {
           <thead>
             <tr>
               <TH>Seg</TH><TH>Time (IST)</TH><TH>XGB Prob</TH>
-              {hasBL && <TH>BiLSTM Prob</TH>}
               <TH>ECG HR</TH><TH>Ref HR</TH>
               <TH>RR (ms)</TH><TH>Ref RR (ms)</TH><TH>ΔRR (ms)</TH>
               <TH>SpO2 µ</TH><TH>LF/HF</TH><TH>Resp Rate</TH><TH>HR Gate</TH>
@@ -91,7 +86,6 @@ export function SegTable({ merged, hasBL, onSel, onTab }) {
                 <TD mono col="#60a5fa">#{r.segment_idx}</TD>
                 <TD col="#334155" fontSize={10}>{toISTShort(r.timestamp)}</TD>
                 <TD mono col={r.apnea_pred === 1 ? '#ef4444' : '#22c55e'}>{r.apnea_prob?.toFixed(3)}</TD>
-                {hasBL && <TD mono col={r.bilstm_pred === 1 ? '#a78bfa' : r.bilstm_pred === 0 ? '#22c55e' : '#334155'}>{r.bilstm_prob?.toFixed(3) ?? '—'}</TD>}
                 <TD mono col="#64748b">{r.ecg_hr_bpm?.toFixed(1)}</TD>
                 <TD mono col="#64748b">{r.ref_hr_bpm?.toFixed(1)}</TD>
                 {/* RR columns */}

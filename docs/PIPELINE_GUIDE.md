@@ -37,9 +37,6 @@ MODEL_PATH=apnea_model_xgb_seq.pkl
 SCALER_PATH=apnea_scaler_tree.pkl
 THRESHOLD=0.55
 
-# Secondary BiLSTM model (optional — enables consensus mode)
-BILSTM_MODEL_PATH=apnea_model.keras
-BILSTM_SCALER_PATH=apnea_scaler.pkl
 
 # Output
 OUTPUT_DIR=infer_output/
@@ -49,21 +46,17 @@ OUTPUT_DIR=infer_output/
 
 ## 2. Train the Model
 
-Downloads MIMIC-IV and SLPDB automatically, runs feature extraction, trains the BiLSTM, and saves model artefacts.
+Downloads MIMIC-IV and SLPDB automatically, runs feature extraction, trains the model, and saves model artefacts.
 
 ```bash
 source venv/bin/activate
 
-# Default: trains BOTH BiLSTM and XGBoost on MIMIC-IV + SLPDB
+# Default: trains XGBoost on MIMIC-IV + SLPDB
 # ⚠ --fresh will prompt for confirmation before deleting the DB
 python pipeline/pipeline.py --fresh --save-model
 
 # Subsequent runs — reuse cached MIMIC/SLPDB data (no prompt)
 python pipeline/pipeline.py --save-model
-
-# Train only one model (BiLSTM or XGBoost)
-python pipeline/pipeline.py --save-model --bilstm-only
-python pipeline/pipeline.py --save-model --xgb-only
 
 # Fast iteration — specific SLPDB records only
 python pipeline/pipeline.py --save-model --slpdb-records slp37 slp41 slp66 slp48
@@ -85,21 +78,17 @@ python pipeline/pipeline.py --save-model --no-slpdb
 
 | File | Model | Contents |
 |---|---|---|
-| `apnea_model.keras` | BiLSTM | Full trained BiLSTM model |
-| `apnea_best.keras` | BiLSTM | Best checkpoint (highest val AUC) |
-| `apnea_scaler.pkl` | BiLSTM | Fitted StandardScaler (30 features) |
-| `apnea_feature_cols.json` | BiLSTM | Ordered list of the 30 feature columns |
-| `apnea_thresholds.json` | BiLSTM | Optimal thresholds `{global, mimic, slpdb}` |
+| `apnea_feature_cols.json` | XGBoost | Ordered list of the 30 feature columns |
 | `apnea_model_xgb_seq.pkl` | XGBoost | Trained XGBClassifier (sequences flattened T×F) |
 | `apnea_scaler_tree.pkl` | XGBoost | Fitted StandardScaler for XGBoost input |
 
 **Latest training results (June 2026):**
 
-| Dataset | BiLSTM AUC | BiLSTM F1 | XGBoost AUC |
-|---|---|---|---|
-| **Overall** | **0.912** | 0.772 | — |
-| MIMIC (ICU) | 0.917 | 0.714 | — |
-| SLPDB (Sleep lab) | 0.906 | 0.784 | — |
+| Dataset | XGBoost AUC | XGBoost F1 |
+|---|---|---|
+| **Overall** | **0.912** | 0.772 |
+| MIMIC (ICU) | 0.917 | 0.714 |
+| SLPDB (Sleep lab) | 0.906 | 0.784 |
 
 ---
 
@@ -116,20 +105,11 @@ Each run performs these steps automatically:
 4. **ECG sleep detection** — scores each 30-second epoch using IST time gate + HR/SDNN heuristics, isolates sleep-only windows
 5. Builds 30-second segment CSV (SpO2 aligned by timestamp)
 6. **Primary inference (XGBoost)** — HRV extraction → feature scaling → model → AHI proxy
-7. **Secondary inference (BiLSTM, optional)** — same CSV, separate model → consensus check
-8. If both models disagree on normal/abnormal classification → `needs_review = true` in Supabase
-9. Upserts merged results to Supabase `apnea_results` table
+7. Upserts merged results to Supabase `apnea_results` table
 
 ### Commands
 
 ```bash
-# Single admission — XGBoost seq as primary, BiLSTM as consensus
-python automation/mongo_infer.py --admission ADM1819906487 --write-supabase \
-    --model apnea_model_xgb_seq.pkl \
-    --scaler apnea_scaler_tree.pkl \
-    --threshold 0.55 \
-    --model-bilstm apnea_model.keras \
-    --scaler-bilstm apnea_scaler.pkl
 
 # Or use defaults from .env (same result if MODEL_PATH set correctly)
 python automation/mongo_infer.py --admission ADM1819906487 --write-supabase
@@ -162,8 +142,6 @@ Under `infer_output/<admissionId>/`:
 | `ADM*_validated.csv` | Inference results with all validation columns appended (see Section 4) |
 | `infer_summary.csv` | One row: AHI, severity, duration_min, n_apnea, scored_segments, mean_prob |
 | `infer_summary.txt` | Human-readable clinical summary block |
-| `bilstm/infer_results_ADM*.csv` | BiLSTM per-segment predictions (consensus mode) |
-| `bilstm/infer_summary.csv` | BiLSTM summary (consensus mode) |
 
 ### Supabase Schema
 
@@ -184,11 +162,7 @@ CREATE TABLE IF NOT EXISTS apnea_results (
     n_apnea           INT,
     duration_min      FLOAT,
     model_threshold   FLOAT,
-    -- Consensus fields (populated when BiLSTM model path is provided)
-    ahi_bilstm        FLOAT,
-    severity_bilstm   TEXT,
-    models_agree      BOOLEAN,
-    needs_review      BOOLEAN      -- true when XGBoost and BiLSTM disagree
+    needs_review      BOOLEAN      -- true when physiological validator disagrees
 );
 
 -- Run after creating the table to add apnea_validator.py output columns:
@@ -353,7 +327,7 @@ python pipeline/edf_test_loader.py \
 | `FS_ECG` | 125 Hz | ECG target sample rate |
 | `FS_RESP` | 4 Hz | EDR / respiratory signal rate |
 | `SEGMENT_LEN_S` | 30 s | Segment window length |
-| `TIMESTEPS` | 10 | Sequence length for BiLSTM and XGBoost |
+| `TIMESTEPS` | 10 | Sequence length for XGBoost |
 | `N_MIMIC_RECORDS` | 60 | MIMIC-IV records to download |
 
 ### `automation/mongo_infer.py` — Pipeline Constants
@@ -366,8 +340,6 @@ python pipeline/edf_test_loader.py \
 | `MIN_SEGMENTS` | 11 | Minimum segments for inference |
 | `MIN_DURATION_MINUTES` | 30 | Skip recordings shorter than this |
 | `COMPLETION_GAP_HOURS` | 2 | Hours without new packets → recording done |
-| `BILSTM_MODEL_PATH` | `apnea_model.keras` | Secondary model path (env: `BILSTM_MODEL_PATH`) |
-| `BILSTM_SCALER_PATH` | `apnea_scaler.pkl` | Secondary scaler path (env: `BILSTM_SCALER_PATH`) |
 
 ### `automation/ecg_sleep_filter.py` — Sleep Detection Constants
 
@@ -392,11 +364,10 @@ python pipeline/edf_test_loader.py \
 | `wfdb not installed` | Missing dependency | `pip install wfdb` |
 | `xgboost not installed` | Missing dependency | `pip install xgboost` |
 | `No MIMIC records fetched` | PhysioNet network timeout | Retry; PhysioNet is rate-limited |
-| `[XGB] No segments in DB` | Running `--xgb-only` on empty DB | Run BiLSTM first (without `--xgb-only`) to populate `vitals_pipeline.db` |
 | `[FRESH] Aborted.` | Typed anything other than `yes` at the confirmation prompt | Re-run and type `yes` to confirm DB deletion |
 | `MongoDB connection failed` | Wrong URI / env vars | Check `.env` — `MONGO_URI` and `MONGO_DB` |
 | `[SLEEP] Only N sleep segments` | Short recording or daytime admission | Add `--no-sleep-filter` to use full recording |
 | `[AHI] Timestamp-derived duration looks wrong` | Sleep filter trimmed timestamps; AHI falls back to segment count | Expected — AHI still computed correctly from segment count |
 | `[INFER] Primary model failed` | Model or scaler file missing | Check `MODEL_PATH` / `SCALER_PATH` in `.env` |
-| `needs_review = true` in Supabase | XGBoost and BiLSTM disagree on normal/abnormal | Expected behaviour — flag for clinical review |
+| `needs_review = true` in Supabase | Physiological validator disagrees with XGBoost | Expected behaviour — flag for clinical review |
 | `Only one class in test set` | All-normal or all-apnea training split | Add more diverse SLPDB records |

@@ -5,11 +5,7 @@ import logging
 import pickle
 import numpy as np
 import pandas as pd
-try:
-    import tensorflow as tf
-    HAS_TF = True
-except ImportError:
-    HAS_TF = False
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score, classification_report
@@ -18,7 +14,6 @@ from pipeline.modules.config import *
 from pipeline.modules.config import (
     _SPO2_IDXS, _HAS_SPO2_IDX, _ABP_IDXS, _CROSS_IDXS, _HAS_ABP_IDX
 )
-from pipeline.modules.model import _build_model, _focal_loss
 from pipeline.modules.ingest_mimic import ingest_mimic_records
 from pipeline.modules.ingest_slpdb import ingest_slpdb_records
 
@@ -173,12 +168,8 @@ def run_apnea_module(
         if len(slpdb_rows) == 0:
             logger.warning("[SLPDB] No SLPDB segments loaded — training will use MIMIC only")
 
-    # ── STAGE 3: Train modality-aware BiLSTM ─────────────────────────────────
+    # ── STAGE 3: Prepare Dataset for Training ─────────────────────────────────
     log_module("apnea", "train", "started")
-    if not HAS_TF:
-        logger.error("[APNEA] TensorFlow not installed")
-        log_module("apnea", "train", "failed", "tensorflow not installed", 0)
-        return
 
     # Build MIMIC DataFrame from DB (most up-to-date version)
     segs = fetch_apnea_segments(run_id=run_id)
@@ -245,200 +236,7 @@ def run_apnea_module(
         logger.warning("[APNEA] Not enough segments for sequence model")
         return
 
-    # Build sequences on combined array
-    X_seq, y_seq = _build_sequences(X_scaled, y_all, TIMESTEPS)
-    _, src_seq = _build_sequences(X_scaled, src_all, TIMESTEPS)
-
-    # Original approach: split sequences, stratify by label
-    X_tr_val, X_te, y_tr_val, y_te, src_tr_val, src_te = train_test_split(
-        X_seq, y_seq, src_seq,
-        test_size=0.20, stratify=y_seq, random_state=42,
-    )
-    X_tr, X_val, y_tr, y_val, src_tr, src_val = train_test_split(
-        X_tr_val, y_tr_val, src_tr_val,
-        test_size=0.125,  # Original working value
-        stratify=y_tr_val,
-        random_state=42,
-    )
-
-    n_mimic_tr  = int((src_tr == 0).sum())
-    n_slpdb_tr  = int((src_tr == 1).sum())
-    n_mimic_val = int((src_val == 0).sum())
-    n_slpdb_val = int((src_val == 1).sum())
-    n_mimic_te  = int((src_te == 0).sum())
-    n_slpdb_te  = int((src_te == 1).sum())
-
-    logger.info(
-        "[TRAIN] Train: %d (MIMIC=%d, SLPDB=%d) | "
-        "Val: %d (MIMIC=%d, SLPDB=%d) | "
-        "Test: %d (MIMIC=%d, SLPDB=%d)",
-        len(y_tr), n_mimic_tr, n_slpdb_tr,
-        len(y_val), n_mimic_val, n_slpdb_val,
-        len(y_te), n_mimic_te, n_slpdb_te,
-    )
-
-    # Calculate class weights
-    pos = int(y_tr.sum())
-    neg = len(y_tr) - pos
-    class_weight = {0: 1.0, 1: neg / (pos + 1e-6)}
-    logger.info("[TRAIN] Class weights: normal=%.3f, apnea=%.3f", 
-                class_weight[0], class_weight[1])
-
-    # Apply modality dropout
-    X_tr_aug = _apply_modality_dropout_sequences(
-        X_tr, src_tr,
-        drop_spo2_prob=0.30,
-        drop_abp_prob=0.30,
-    )
-
-    # Build and compile model
-    model = _build_model(n_features=len(APNEA_FEATURE_COLS), timesteps=TIMESTEPS)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=_focal_loss(gamma=2.0, alpha=0.75),
-        metrics=["AUC"],
-    )
-    model.summary(print_fn=logger.info)
-
-    # Callbacks with ModelCheckpoint
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            "apnea_best.keras",
-            monitor="val_auc",
-            save_best_only=True,
-            mode="max",
-            verbose=0,
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_auc",
-            patience=6,
-            restore_best_weights=True,
-            mode="max",
-            verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_auc",
-            factor=0.5,
-            patience=3,
-            mode="max",
-            min_lr=1e-5,
-            verbose=1,
-        ),
-    ]
-
-    # Train
-    history = model.fit(
-        X_tr_aug, y_tr,
-        validation_data=(X_val, y_val),
-        epochs=80,
-        batch_size=32,
-        class_weight=class_weight,
-        verbose=1,
-        callbacks=callbacks,
-    )
-
-    # Evaluation
-    y_prob = model.predict(X_te, verbose=0).flatten()
-
-    if len(np.unique(y_te)) > 1:
-        thresholds = np.arange(0.25, 0.75, 0.01)
-        
-        # Global threshold
-        f1s = [f1_score(y_te, (y_prob > t).astype(int), zero_division=0) for t in thresholds]
-        best_thresh = float(thresholds[np.argmax(f1s)])
-        auc = roc_auc_score(y_te, y_prob)
-        
-        # Domain-specific thresholds
-        mimic_mask = src_te == 0
-        mimic_thresh = best_thresh
-        slpdb_thresh = best_thresh
-        
-        if mimic_mask.sum() >= 5 and len(np.unique(y_te[mimic_mask])) > 1:
-            mimic_f1s = [f1_score(y_te[mimic_mask], (y_prob[mimic_mask] > t).astype(int),
-                                  zero_division=0) for t in thresholds]
-            mimic_thresh = float(thresholds[np.argmax(mimic_f1s)])
-        
-        slpdb_mask = src_te == 1
-        if slpdb_mask.sum() >= 5 and len(np.unique(y_te[slpdb_mask])) > 1:
-            slpdb_f1s = [f1_score(y_te[slpdb_mask], (y_prob[slpdb_mask] > t).astype(int),
-                                  zero_division=0) for t in thresholds]
-            slpdb_thresh = float(thresholds[np.argmax(slpdb_f1s)])
-        
-        logger.info("[EVAL] Domain thresholds: MIMIC=%.2f  SLPDB=%.2f  Global=%.2f", 
-                    mimic_thresh, slpdb_thresh, best_thresh)
-        
-        # Compute validation AUC
-        y_val_prob = model.predict(X_val, verbose=0).flatten()
-        val_auc = roc_auc_score(y_val, y_val_prob) if len(np.unique(y_val)) > 1 else 0.0
-        logger.info("[EVAL] Validation AUC=%.4f", val_auc)
-
-        # Bootstrap CI for global AUC
-        from sklearn.utils import resample as sk_resample
-        rng = np.random.RandomState(42)
-        boots = [
-            roc_auc_score(y_te[idx], y_prob[idx])
-            for _ in range(1000)
-            for idx in [rng.randint(0, len(y_te), len(y_te))]
-            if len(np.unique(y_te[idx])) > 1
-        ]
-        ci_lo, ci_hi = np.percentile(boots, [2.5, 97.5])
-
-        logger.info(
-            "[EVAL] Overall AUC=%.4f (95%% CI %.3f–%.3f) threshold=%.2f F1=%.3f",
-            auc, ci_lo, ci_hi, best_thresh, max(f1s),
-        )
-
-        # Per-source evaluation with domain-specific thresholds
-        for src_val, src_name, src_thresh in [(0, "MIMIC", mimic_thresh), (1, "SLPDB", slpdb_thresh)]:
-            mask = src_te == src_val
-            if mask.sum() >= 5 and len(np.unique(y_te[mask])) > 1:
-                src_auc = roc_auc_score(y_te[mask], y_prob[mask])
-                src_f1 = f1_score(y_te[mask], (y_prob[mask] > src_thresh).astype(int), zero_division=0)
-                src_sens = recall_score(y_te[mask], (y_prob[mask] > src_thresh).astype(int), zero_division=0)
-                src_prec = precision_score(y_te[mask], (y_prob[mask] > src_thresh).astype(int), zero_division=0)
-                logger.info(
-                    "[EVAL] %-6s AUC=%.3f F1=%.3f Sensitivity=%.1f%% Precision=%.1f%% n=%d (thresh=%.2f)",
-                    src_name, src_auc, src_f1, src_sens * 100, src_prec * 100, int(mask.sum()), src_thresh,
-                )
-
-        report = classification_report(
-            y_te, (y_prob > best_thresh).astype(int),
-            target_names=["Normal", "Apnea"], output_dict=True,
-        )
-        logger.info("\n%s", classification_report(
-            y_te, (y_prob > best_thresh).astype(int),
-            target_names=["Normal", "Apnea"],
-        ))
-
-        insert_apnea_results(auc, report)
-        log_module("apnea", "train", "done", f"auc={auc:.4f}", total_segs + len(slpdb_rows))
-        
-        # Save thresholds alongside model
-        if save_model and HAS_TF:
-            thresholds_dict = {
-                "global": best_thresh,
-                "mimic": mimic_thresh,
-                "slpdb": slpdb_thresh
-            }
-            with open("apnea_thresholds.json", "w") as f:
-                json.dump(thresholds_dict, f, indent=2, cls=_NumpyEncoder)
-            logger.info("[SAVE] Thresholds → apnea_thresholds.json")
-            
-    else:
-        logger.warning("[APNEA] Only one class in test set — AUC not computed")
-        log_module("apnea", "train", "skipped", "Single class in test", 0)
-
-    # Save model
-    if save_model and HAS_TF:
-        model.save("apnea_model.keras")
-        with open("apnea_scaler.pkl", "wb") as f:
-            pickle.dump(scaler, f)
-        with open("apnea_feature_cols.json", "w") as f:
-            json.dump(APNEA_FEATURE_COLS, f, indent=2, cls=_NumpyEncoder)
-        logger.info("[SAVE] Model → apnea_model.keras")
-        logger.info("[SAVE] Scaler → apnea_scaler.pkl")
-        logger.info("[SAVE] Features → apnea_feature_cols.json")
-
+    log_module("apnea", "train", "done", f"data_ready=True", total_segs + len(slpdb_rows))
+    logger.info("[APNEA] Dataset prepared: %d combined segments. XGBoost training runs via pipeline.py.",
+                len(X_scaled))
     logger.info("[APNEA] Module complete.")
-
-

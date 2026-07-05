@@ -2,7 +2,7 @@
 edf_test_loader.py
 ==================
 Load converted EDF data (CSV or JSON from edf_to_pipeline.py) and run
-them through the pipeline's feature extraction + BiLSTM inference.
+them through the pipeline's feature extraction + XGBoost inference.
 
 This is a DROP-IN TEST HARNESS — it does NOT need MIMIC or SLPDB access.
 Point it at your converted files and it will:
@@ -19,8 +19,8 @@ Usage
 
   # Run inference with a saved model
   python edf_test_loader.py --data ./converted/ --mode infer \\
-      --model apnea_model.keras \\
-      --scaler apnea_scaler.pkl \\
+      --model apnea_model_xgb_seq.pkl \\
+      --scaler apnea_scaler_tree.pkl \\
       --features apnea_feature_cols.json
 
   # Load from JSON instead of CSV
@@ -316,9 +316,9 @@ def main():
     parser.add_argument("--data",     "-d", required=True,
                         help="Converted JSON file or directory of CSVs")
     parser.add_argument("--mode",     choices=["features", "infer"], default="features",
-                        help="features: extract only; infer: features + BiLSTM inference")
-    parser.add_argument("--model",    default="apnea_model.keras",  help="Saved .keras model")
-    parser.add_argument("--scaler",   default="apnea_scaler.pkl",   help="Saved scaler pickle")
+                        help="features: extract only; infer: features + XGBoost inference")
+    parser.add_argument("--model",    default="apnea_model_xgb_seq.pkl", help="Saved XGBoost .pkl model")
+    parser.add_argument("--scaler",   default="apnea_scaler_tree.pkl",   help="Saved scaler pickle")
     parser.add_argument("--features", default="apnea_feature_cols.json", help="Feature cols JSON")
     parser.add_argument("--threshold", type=float, default=0.5,     help="Classification threshold")
     parser.add_argument("--out-csv",  default=None,

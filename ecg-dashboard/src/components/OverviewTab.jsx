@@ -3,27 +3,18 @@ import { ResponsiveContainer, ComposedChart, CartesianGrid, XAxis, YAxis, Toolti
 import { Card, Lbl, Empty, St, SevBadge, CS } from './Shared';
 import { toISTShort, ahiSev } from '../utils/format';
 
-export function OverviewTab({ merged, summary, sleepMap, hasBL, onSel, onTab }) {
+export function OverviewTab({ merged, summary, sleepMap, onSel, onTab }) {
   if (!merged?.length) return <Empty msg="Upload infer_results_ADM.csv to see the overview" />;
   
   const admId = merged[0]?.admission_id || summary?.admission_id || '—';
   
-  const blAhi = useMemo(() => {
-    if (!hasBL) return summary?.ahi_bilstm ?? null;
-    const nA = merged.filter(r => r.bilstm_pred === 1).length;
-    const dur = summary?.duration_min;
-    if (!dur) return null;
-    return nA / Math.max(dur / 60, 1e-6);
-  }, [merged, hasBL, summary]);
-  
+
   const cd = useMemo(() => merged.map(r => ({
     idx: r.segment_idx,
     ecg: r.ecg_hr_bpm,
     ref: r.ref_hr_bpm,
     xp: r.apnea_prob,
-    bp: r.bilstm_prob,
     xa: r.apnea_pred === 1 ? (r.ecg_hr_bpm || 60) : null,
-    ba: r.bilstm_pred === 1 ? (r.ecg_hr_bpm || 60) : null,
     fl: r.hr_gate_pass === 0 ? (r.ecg_hr_bpm || 60) : null,
     ts: r.timestamp
   })), [merged]);
@@ -68,22 +59,6 @@ export function OverviewTab({ merged, summary, sleepMap, hasBL, onSel, onTab }) 
             </div>
             {summary?.severity && <div style={{ marginTop: 4 }}><SevBadge s={summary.severity} /></div>}
           </div>
-          <div style={{ width: 1, height: 60, background: '#1a2d4d' }} />
-          <div>
-            <div style={{ color: '#475569', fontSize: 10, marginBottom: 4 }}>BiLSTM AHI</div>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 5 }}>
-              <span style={{ fontSize: 40, fontWeight: 900, color: '#a78bfa', fontFamily: 'JetBrains Mono', lineHeight: 1 }}>
-                {blAhi != null ? blAhi.toFixed(1) : '—'}
-              </span>
-              <span style={{ color: '#1e3a5f', fontSize: 12 }}>/hr</span>
-            </div>
-            {blAhi != null && <div style={{ marginTop: 4 }}><SevBadge s={ahiSev(blAhi)} /></div>}
-          </div>
-          {!hasBL && (
-            <div style={{ color: '#1e3a5f', fontSize: 11, marginLeft: 'auto', padding: '6px 12px', background: '#0d1d30', borderRadius: 6, border: '1px solid #1a2d4d' }}>
-              BiLSTM file not loaded
-            </div>
-          )}
         </div>
       </Card>
       
@@ -98,11 +73,11 @@ export function OverviewTab({ merged, summary, sleepMap, hasBL, onSel, onTab }) 
       </div>
       
       <Card>
-        <Lbl>Full Recording Timeline (IST) — blue shading=sleep | ● XGB apnea | ● BiLSTM apnea | ● HR flagged</Lbl>
+        <Lbl>Full Recording Timeline (IST) — blue shading=sleep | ● XGB apnea | ● HR flagged</Lbl>
         <div style={{ display: 'flex', gap: 14, marginBottom: 6, fontSize: 10, flexWrap: 'wrap' }}>
           {[
             ['ECG HR', '#60a5fa'], ['Ref HR', '#34d399'], ['XGB Prob', '#f97316'],
-            ['BiLSTM Prob', '#a78bfa'], ['XGB Apnea', '#ef4444'], ['BiLSTM Apnea', '#fb923c'], ['HR Flagged', '#eab308']
+            ['XGB Apnea', '#ef4444'], ['HR Flagged', '#eab308']
           ].map(([l, c]) => (
             <span key={l} style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#334155' }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: c }} />
@@ -139,10 +114,8 @@ export function OverviewTab({ merged, summary, sleepMap, hasBL, onSel, onTab }) 
             <Line yAxisId="hr" dataKey="ecg" name="ECG HR (bpm)" stroke="#60a5fa" strokeWidth={1.4} dot={false} connectNulls isAnimationActive={false} />
             <Line yAxisId="hr" dataKey="ref" name="Ref HR (bpm)" stroke="#34d399" strokeWidth={1} dot={false} connectNulls strokeDasharray="4 2" isAnimationActive={false} />
             <Line yAxisId="p" dataKey="xp" name="XGB Prob" stroke="#f97316" strokeWidth={1} dot={false} connectNulls isAnimationActive={false} />
-            {hasBL && <Line yAxisId="p" dataKey="bp" name="BiLSTM Prob" stroke="#a78bfa" strokeWidth={1} dot={false} connectNulls isAnimationActive={false} />}
             
             <Line yAxisId="hr" dataKey="xa" name="XGB Apnea" stroke="none" strokeWidth={0} dot={evDot('#ef4444')} activeDot={false} isAnimationActive={false} connectNulls={false} />
-            <Line yAxisId="hr" dataKey="ba" name="BiLSTM Apnea" stroke="none" strokeWidth={0} dot={evDot('#fb923c')} activeDot={false} isAnimationActive={false} connectNulls={false} />
             <Line yAxisId="hr" dataKey="fl" name="HR Flagged" stroke="none" strokeWidth={0} dot={evDot('#eab308')} activeDot={false} isAnimationActive={false} connectNulls={false} />
             
             <ReferenceLine yAxisId="p" y={0.55} stroke="#ef444440" strokeDasharray="4 2" label={{ value: '0.55', fill: '#ef4444', fontSize: 8 }} />

@@ -2,11 +2,9 @@
 
 [![Repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/Sathvik-Tumati/Apnea)
 
-A multi-source, modality-aware sleep apnea detection system that trains **two complementary models** in a single pipeline run:
-- **Modality-Aware BiLSTM** — deep sequence model with ECG/SpO2/ABP modality flags
-- **XGBoost (seq)** — gradient-boosted trees operating on the same flattened sequence features
+A multi-source, modality-aware sleep apnea detection system that trains an **XGBoost (seq)** model — gradient-boosted trees operating on flattened sequence features.
 
-Both models train on MIMIC-IV and SLPDB with the same train/val/test split, so results are directly comparable. At inference time, both models run on each admission and their outputs are compared — disagreements are flagged for clinical review.
+The model trains on MIMIC-IV and SLPDB with a stratified train/val/test split. At inference time, the model runs on each admission and its output is flagged for clinical review if the physiological validator disagrees.
 
 ---
 
@@ -14,7 +12,7 @@ Both models train on MIMIC-IV and SLPDB with the same train/val/test split, so r
 
 For deep dives into the technical architecture and logic, see the `docs/` directory:
 - [**Complete Pipeline Guide**](docs/PIPELINE_GUIDE.md): Step-by-step commands for training, EDF inference, and live MongoDB inference.
-- [**Model Architecture**](docs/architecture.md): BiLSTM and XGBoost model details, modality flags, and modality dropout.
+- [**Model Architecture**](docs/architecture.md): XGBoost model details, modality flags, and modality dropout.
 - [**Feature Engineering**](docs/feature_engineering.md): Details on all 30 features extracted per segment.
 - [**Sleep Detection**](docs/sleep_detection.md): How `ecg_sleep_filter.py` isolates sleep-only epochs before inference.
 - [**Apnea Validator**](docs/apnea_validator.md): Full technical reference for `apnea_validator.py` — scoring logic, constants, output columns, dual-mechanism primary criterion, and calibration guide.
@@ -31,7 +29,6 @@ project2/
 │   │   ├── features.py           # Signal processing and feature extraction
 │   │   ├── ingest_mimic.py       # MIMIC-IV streaming and pseudo-labelling
 │   │   ├── ingest_slpdb.py       # SLPDB streaming and annotation parsing
-│   │   ├── model.py              # Modality-Aware BiLSTM + GatherFlags layer
 │   │   └── train.py              # Dataset building and training loop
 │   ├── pipeline.py               # Training orchestrator  ← RUN TO TRAIN
 │   ├── infer.py                  # Core inference engine (called by mongo_infer.py)
@@ -43,11 +40,7 @@ project2/
 ├── docs/                         # Technical documentation
 ├── apnea_validator.py            # Post-inference physiological plausibility validator
 ├── spo2_split_ahi.py             # Diagnostic: per-window SpO2-aware AHI breakdown
-├── apnea_model.keras             # BiLSTM saved model
-├── apnea_best.keras              # BiLSTM best checkpoint (highest val AUC)
-├── apnea_scaler.pkl              # BiLSTM fitted StandardScaler (30 features)
 ├── apnea_feature_cols.json       # Ordered list of the 30 feature column names
-├── apnea_thresholds.json         # BiLSTM optimal thresholds {global, mimic, slpdb}
 ├── apnea_model_xgb_seq.pkl       # XGBoost sequence model (primary inference model)
 ├── apnea_model_xgb_flat.pkl      # XGBoost flat model (per-segment, no sequence context)
 ├── apnea_model_lgbm_seq.pkl      # LightGBM sequence model
@@ -68,14 +61,6 @@ source venv/bin/activate
 
 # Single admission — full pipeline (sleep filter + dual-model inference + Supabase write)
 python automation/mongo_infer.py --admission ADM1819906487 --write-supabase
-
-# Use XGBoost as primary, BiLSTM as consensus
-python automation/mongo_infer.py --admission ADM1819906487 --write-supabase \
-    --model apnea_model_xgb_seq.pkl \
-    --scaler apnea_scaler_tree.pkl \
-    --threshold 0.55 \
-    --model-bilstm apnea_model.keras \
-    --scaler-bilstm apnea_scaler.pkl
 
 # All admissions from the last 24 hours
 python automation/mongo_infer.py --since 24h --write-supabase
@@ -99,9 +84,7 @@ python automation/mongo_infer.py --admission ADM1819906487 --write-supabase --re
 4. ECG sleep detection (IST time gate + HR/SDNN scoring) → isolate sleep epochs
 5. Build segment CSV (30 s windows, SpO2 aligned by timestamp)
 6. Primary model inference (XGBoost) → AHI proxy
-7. Secondary model inference (BiLSTM, optional) → consensus check
-8. If both models disagree → flagged for clinical review
-9. Upsert results → Supabase apnea_results table
+7. Upsert results → Supabase apnea_results table
 ```
 
 ---
@@ -197,32 +180,22 @@ This is a standalone diagnostic — it does not modify any files.
 ```bash
 source venv/bin/activate
 
-# Default: trains BOTH BiLSTM and XGBoost on MIMIC-IV + SLPDB
+# Default: trains XGBoost on MIMIC-IV + SLPDB
 # Note: --fresh prompts for confirmation before deleting the DB
 python pipeline/pipeline.py --fresh --save-model
 
 # Subsequent runs reuse cached data (no prompt, much faster)
 python pipeline/pipeline.py --save-model
 
-# Train only one model
-python pipeline/pipeline.py --save-model --bilstm-only
-python pipeline/pipeline.py --save-model --xgb-only
-
 # Train on specific SLPDB records only (fast iteration)
 python pipeline/pipeline.py --save-model --slpdb-records slp37 slp41 slp66
 ```
-
-> **Note:** When running `--xgb-only`, XGBoost reads segments already in `vitals_pipeline.db` from a prior BiLSTM run. If the DB is empty, run BiLSTM first or use `--fresh --save-model` (no `--xgb-only`).
 
 **Saved artefacts (in `project2/`):**
 
 | File | Model | Contents |
 |---|---|---|
-| `apnea_model.keras` | BiLSTM | Full trained BiLSTM model |
-| `apnea_best.keras` | BiLSTM | Best val AUC checkpoint |
-| `apnea_scaler.pkl` | BiLSTM | Fitted StandardScaler (30 features) |
-| `apnea_feature_cols.json` | BiLSTM | Ordered feature column list |
-| `apnea_thresholds.json` | BiLSTM | `{"global": 0.51, "mimic": 0.52, "slpdb": 0.57}` |
+| `apnea_feature_cols.json` | XGBoost | Ordered feature column list |
 | `apnea_model_xgb_seq.pkl` | XGBoost | Trained XGBClassifier — sequences flattened to T×F |
 | `apnea_model_xgb_flat.pkl` | XGBoost | Per-segment XGBoost (no sequence context) |
 | `apnea_model_lgbm_seq.pkl` | LightGBM | LightGBM on same T×F flattened sequences |
@@ -249,9 +222,7 @@ MODEL_PATH=apnea_model_xgb_seq.pkl
 SCALER_PATH=apnea_scaler_tree.pkl
 THRESHOLD=0.55
 
-# Secondary BiLSTM model (optional — enables consensus mode)
-BILSTM_MODEL_PATH=apnea_model.keras
-BILSTM_SCALER_PATH=apnea_scaler.pkl
+
 
 # Output
 OUTPUT_DIR=infer_output/
@@ -280,11 +251,7 @@ CREATE TABLE IF NOT EXISTS apnea_results (
     n_apnea           INT,
     duration_min      FLOAT,
     model_threshold   FLOAT,
-    -- Consensus fields (populated when BiLSTM model is provided)
-    ahi_bilstm        FLOAT,
-    severity_bilstm   TEXT,
-    models_agree      BOOLEAN,
-    needs_review      BOOLEAN      -- true when XGBoost and BiLSTM disagree
+    needs_review      BOOLEAN      -- true when physiological validator disagrees
 );
 
 -- Run this ALTER after creating the table to add validation columns:
@@ -310,7 +277,6 @@ After each run, `infer_output/<admissionId>/` contains:
 | `ADM*_segments.csv` | Sleep-filtered, feature-enriched segment CSV (includes `spo2Data[0..29]` raw array) |
 | `ADM*_sleep_windows.csv` | Sleep detection results (is_sleep, window_id, HR, SDNN) |
 | `infer_results_ADM*.csv` | Per-segment XGBoost predictions and features |
-| `bilstm/infer_results_ADM*.csv` | Per-segment BiLSTM predictions |
 | `infer_summary.csv` | One row per admission: AHI, severity, duration, etc. |
 | `infer_summary.txt` | Human-readable clinical summary |
 | `ADM*_validated.csv` | Inference results with validation columns appended (see below) |
@@ -344,8 +310,6 @@ After each run, `infer_output/<admissionId>/` contains:
 
 ```bash
 # Core ML
-tensorflow >= 2.x
-keras
 numpy
 pandas
 scipy

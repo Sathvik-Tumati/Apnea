@@ -428,15 +428,7 @@ export function ECGViewerTab({ merged, ecgMap, spo2Map, selSeg, onSel }) {
       
       <div style={{ width: 212, background: '#080f1e', borderLeft: '1px solid #111f33', overflowY: 'auto', padding: '12px 10px', flexShrink: 0 }}>
         <ProbGauge prob={cur?.apnea_prob} />
-        {cur?.bilstm_prob != null && (
-          <div style={{ textAlign: 'center', marginTop: 2, marginBottom: 8 }}>
-            <div style={{ color: '#1e3a5f', fontSize: 9, marginBottom: 2 }}>BILSTM PROB</div>
-            <div style={{ fontFamily: 'JetBrains Mono', fontSize: 16, fontWeight: 700, color: cur.bilstm_pred === 1 ? '#a78bfa' : '#334155' }}>
-              {cur.bilstm_prob.toFixed(3)}
-            </div>
-          </div>
-        )}
-        
+
         <div style={{ borderTop: '1px solid #111f33', paddingTop: 8 }}>
           {FEATS.map(([l, v, u]) => (
             <div key={l} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '3px 2px', borderBottom: '1px solid #0a111e' }}>

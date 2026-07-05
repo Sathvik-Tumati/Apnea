@@ -5,7 +5,6 @@ import Papa from 'papaparse';
 export const FDEFS = [
   { key: 'segments', label: 'ADM_segments.csv', file: 'ADM_segments.csv' },
   { key: 'inferXgb', label: 'infer_results_ADM.csv', file: 'infer_results_ADM.csv' },
-  { key: 'inferBL', label: 'bilstm_infer_results.csv', file: 'bilstm_infer_results.csv' },
   { key: 'sleep', label: 'sleep_windows.csv', file: 'sleep_windows.csv' },
   { key: 'summary', label: 'infer_summary.csv', file: 'infer_summary.csv' },
 ];
@@ -99,7 +98,6 @@ export function UploadZone({ st, pg, handle }) {
       if (n.includes('segment')) handle(f, 'segments');
       else if (n.includes('summary')) handle(f, 'summary');
       else if (n.includes('sleep')) handle(f, 'sleep');
-      else if (n.includes('bilstm') || n.includes('bi_lstm')) handle(f, 'inferBL');
       else if (n.includes('infer') || n.includes('result')) handle(f, 'inferXgb');
     });
   }, [handle]);
