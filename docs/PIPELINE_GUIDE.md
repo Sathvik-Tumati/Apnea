@@ -158,8 +158,8 @@ Under `infer_output/<admissionId>/`:
 |---|---|
 | `ADM*_segments.csv` | Sleep-filtered, SpO2-enriched segment CSV fed to the model |
 | `ADM*_sleep_windows.csv` | Per-segment sleep scores (is_sleep, window_id, HR, SDNN, hour_ist) |
-| `infer_results_ADM*.csv` | Per-segment predictions: apnea_prob, apnea_pred, features, quality flags |
-| `infer_results_ADM*_validated.csv` | Same as above with validation score, verdict, spo2_drop_pct appended |
+| `infer_results_ADM*.csv` | Per-segment XGBoost predictions: apnea_prob, apnea_pred, features, quality flags |
+| `ADM*_validated.csv` | Inference results with all validation columns appended (see Section 4) |
 | `infer_summary.csv` | One row: AHI, severity, duration_min, n_apnea, scored_segments, mean_prob |
 | `infer_summary.txt` | Human-readable clinical summary block |
 | `bilstm/infer_results_ADM*.csv` | BiLSTM per-segment predictions (consensus mode) |
@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS apnea_results (
 -- Run after creating the table to add apnea_validator.py output columns:
 ALTER TABLE apnea_results
     ADD COLUMN IF NOT EXISTS validated_ahi             FLOAT,
+    ADD COLUMN IF NOT EXISTS validated_ahi_upper       FLOAT,   -- upper bound (includes data-incomplete events)
     ADD COLUMN IF NOT EXISTS validation_confirmed      INT,
     ADD COLUMN IF NOT EXISTS validation_probable       INT,
     ADD COLUMN IF NOT EXISTS validation_uncertain      INT,
@@ -206,29 +207,61 @@ ALTER TABLE apnea_results
 
 ## 4. Post-Inference Physiological Validation
 
-`apnea_validator.py` (project root) is a rule-based second-layer verification that checks whether each model-predicted apnea event has physiological support.
+`apnea_validator.py` (project root) is a rule-based second-layer verification that checks whether each model-predicted apnea event has physiological support in the ECG, SpO2, and respiratory signals. It runs *after* inference and does not modify the inference results — it appends additional columns to a validated output CSV.
 
 ### How It Scores
 
-Each predicted segment is scored on four criteria:
+Each predicted segment is scored out of **100 points** across four criteria:
 
 | Criterion | Max pts | What it checks |
 |---|---|---|
-| HR/RR ratio pattern | 40 | RR increases during event + HR spikes at termination |
-| SpO2 desaturation | 35 | ≥3% drop within ±2 segments (accounts for circulation lag) |
+| **Primary — Combined** (max of two mechanisms below) | 40 | Whichever mechanism scores higher is used |
+| SpO2 desaturation | 35 | ≥3% drop within ±2 segments (checks both `spo2_min` and `spo2_mean`) |
 | Respiratory suppression | 15 | EDR resp amplitude drop + elevated rate variability |
-| HR dip-surge pattern | 10 | Bradycardia during apnea → tachycardia at termination |
+| HR dip-surge (fallback) | 10 | Bradycardia during apnea → tachycardia at termination |
+
+**Primary criterion — dual mechanism:**
+
+The primary criterion (40 pts) computes **both** of the following and uses the **higher score**:
+
+- **HR/RespRate ratio** — During apnea, respiratory rate falls toward zero while HR stays elevated. The ratio HR÷RespRate rises sharply. Requires ≥2 clean pre-event baseline segments. A ≥15% ratio increase gives partial credit; ≥80% gives full credit.
+- **HR drop/surge** — Vagal bradycardia during apnea (HR ≥3 bpm below baseline) followed by sympathetic tachycardia at termination (≥4 bpm surge). Always computed when baseline and event HR exist.
+
+The `method_used` column in the output CSV records which mechanism won: `"ratio"`, `"hr_drop"`, `"both"`, or `"neither"`.
+
+**Handling missing data:**
+- **Dynamic scoring**: If SpO2 is structurally unavailable (`has_spo2=0` for baseline and event windows), its 35 points are redistributed proportionally across the other criteria — the maximum achievable score remains 100.
+- **Cluster surge bonus**: For dense clusters of back-to-back apnea events (where there's no time for individual HR recovery), the validator looks for a single recovery surge at the **first clean segment after the cluster ends**. If found, each event in the cluster gets +8 points (capped at 59 — the bonus alone cannot produce a CONFIRMED verdict).
+
+**Data completeness flags:**
+
+Events failing validation are tagged with a `data_completeness` flag indicating *why* they failed:
+
+| Flag | Meaning |
+|---|---|
+| `complete` | All data available — the event genuinely lacks physiological support |
+| `insufficient_spo2` | SpO2 sensor was unavailable for this segment |
+| `insufficient_trailing` | Recording ended before the post-cluster recovery window could be searched |
+| `insufficient_both` | Both SpO2 and trailing window were unavailable |
+
+**AHI range reporting:**
+
+Because data-incomplete events may be real events the validator couldn't check, AHI is reported as a range:
+- **`validated_ahi`** (lower bound): CONFIRMED + PROBABLE only.
+- **`validated_ahi_upper`** (upper bound): Also includes all data-incomplete UNCERTAIN/UNCONFIRMED events.
+
+If the upper bound crosses a severity threshold (e.g. Normal → Mild at AHI=5) that the lower bound doesn't, a flag is logged recommending manual review.
 
 **Verdicts:** `✓ CONFIRMED` (≥60) · `~ PROBABLE` (40–59) · `? UNCERTAIN` (20–39) · `✗ UNCONFIRMED` (<20)
 
 ### Commands
 
 ```bash
-# Basic validation (auto-saves _validated.csv alongside input)
+# Basic validation (auto-saves ADM*_validated.csv alongside input)
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv
 
-# Per-event breakdown
+# Per-event breakdown: shows score, method_used, ratio values, HR drop, SpO2 drop, cluster bonus
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
     --verbose
@@ -236,16 +269,27 @@ python apnea_validator.py \
 # Explicit output path
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
-    --out   infer_output/ADM1819906487/validated_results.csv
+    --out   infer_output/ADM1819906487/ADM1819906487_validated.csv
 
-# Write validation results to Supabase (requires ALTER TABLE above)
+# Write validated_ahi, validated_ahi_upper, and verdict counts to Supabase
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
     --write-supabase
 ```
 
 > [!NOTE]
-> The **validated AHI** counts only CONFIRMED + PROBABLE events. If it is substantially lower than the original AHI, the unconfirmed events may be artifacts or false positives from the model.
+> The **validated AHI** (lower bound) counts only CONFIRMED + PROBABLE events. If it is substantially lower than the original AHI, the unconfirmed events may be artifacts or false positives. Check the `data_completeness` column before dismissing them — if flagged `insufficient_spo2` or `insufficient_trailing`, they couldn't be fully checked.
+
+**SpO2-aware AHI breakdown (diagnostic):**
+
+When SpO2 dropout and apnea clusters coincide, a single blended AHI can be misleading. `spo2_split_ahi.py` splits the validated CSV into contiguous has_spo2=1 and has_spo2=0 windows and reports raw + validated AHI for each:
+
+```bash
+python spo2_split_ahi.py \
+    --validated infer_output/ADM1819906487/ADM1819906487_validated.csv
+```
+
+This is a read-only diagnostic — it does not write any files.
 
 The `automation/ecg_sleep_filter.py` module runs automatically inside `mongo_infer.py`. It can also be run standalone on any segment CSV produced by `--dry-run`:
 

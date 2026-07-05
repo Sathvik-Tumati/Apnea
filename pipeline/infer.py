@@ -111,6 +111,24 @@ SPO2_CSV_COLS = [
     "odi", "t90", "spo2_approx_entropy", "has_spo2",
 ]
 
+# Timezone for human-readable log output
+from datetime import timezone as _tz, timedelta as _td
+_IST = _tz(_td(hours=5, minutes=30))
+
+def _fmt_ts_ist(ts_raw) -> str:
+    """Convert a raw UTC timestamp (str, Timestamp, datetime, or None) to
+    an IST string suitable for log output.  Always safe — returns the raw
+    value stringified on any parse failure, never raises."""
+    if ts_raw is None or (isinstance(ts_raw, str) and not ts_raw.strip()):
+        return ""
+    try:
+        ts = pd.Timestamp(ts_raw)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return str(ts_raw)
+
 APNEA_FEATURE_COLS = [
     "rr_mean", "rr_std", "rmssd", "pnn50", "mean_hr", "hr_range", "lf_hf_ratio",
     "resp_rate_bpm", "resp_rate_variability", "flatline_duration_s",
@@ -198,6 +216,31 @@ def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
             if len(peaks) >= 2:
                 hr = 60.0 / (np.mean(np.diff(peaks)) / fs + 1e-9)
                 if 30 <= hr <= 200:
+                    # ── Half-rate correction ──────────────────────────────────
+                    # If detected HR is physiologically implausible for sleep
+                    # (< 35 bpm) but the signal has enough amplitude to suggest
+                    # real cardiac activity, try inserting midpoint peaks between
+                    # existing ones. This catches T/P-wave locking where every
+                    # other beat is missed.
+                    if hr < 45 and len(peaks) >= 3:
+                        midpoints = ((peaks[:-1] + peaks[1:]) // 2).astype(int)
+                        # Only insert midpoint if local signal has a peak there
+                        valid_mids = []
+                        win = max(1, int(fs * 0.08))
+                        for mp in midpoints:
+                            lo = max(0, mp - win)
+                            hi = min(len(ecg), mp + win)
+                            local = ecg[lo:hi]
+                            if len(local) > 0 and ecg[mp] >= np.percentile(local, 60):
+                                valid_mids.append(mp)
+                        if len(valid_mids) >= len(peaks) * 0.5:
+                            corrected = np.sort(np.concatenate([peaks, valid_mids]))
+                            corrected_hr = 60.0 / (np.mean(np.diff(corrected)) / fs + 1e-9)
+                            if 40 <= corrected_hr <= 120:
+                                logger.debug(
+                                    "_detect_r_peaks: half-rate corrected "
+                                    "%.0f→%.0f bpm", hr, corrected_hr)
+                                return corrected
                     return peaks
                 logger.debug("nk peaks imply %.0f BPM — scipy fallback", hr)
         except Exception as exc:
@@ -209,6 +252,29 @@ def _detect_r_peaks(ecg: np.ndarray, fs: int) -> np.ndarray:
     if len(peaks) < 5:
         thr      = float(np.percentile(ecg, 60))
         peaks, _ = find_peaks(ecg, distance=min_dist, height=thr)
+    
+    # ── Half-rate correction for scipy fallback too ──────────────────────────
+    if len(peaks) >= 3:
+        hr = 60.0 / (np.mean(np.diff(peaks)) / fs + 1e-9)
+        if hr < 45 and len(peaks) >= 3:
+            midpoints = ((peaks[:-1] + peaks[1:]) // 2).astype(int)
+            valid_mids = []
+            win = max(1, int(fs * 0.08))
+            for mp in midpoints:
+                lo = max(0, mp - win)
+                hi = min(len(ecg), mp + win)
+                local = ecg[lo:hi]
+                if len(local) > 0 and ecg[mp] >= np.percentile(local, 60):
+                    valid_mids.append(mp)
+            if len(valid_mids) >= len(peaks) * 0.5:
+                corrected = np.sort(np.concatenate([peaks, valid_mids]))
+                corrected_hr = 60.0 / (np.mean(np.diff(corrected)) / fs + 1e-9)
+                if 40 <= corrected_hr <= 120:
+                    logger.debug(
+                        "_detect_r_peaks (scipy): half-rate corrected "
+                        "%.0f→%.0f bpm", hr, corrected_hr)
+                    return corrected
+    
     return peaks
 
 
@@ -577,9 +643,21 @@ def _run_one_admission(
             feat_df[c] = 0.0
 
     is_flagged = (feat_df["quality_flag"] != "OK").values
-    X_scaled   = scaler.transform(
-        feat_df[APNEA_FEATURE_COLS].fillna(0.0).values.astype(float))
-    X_seq      = _build_sequences(X_scaled, TIMESTEPS)
+
+    # ── Fix 2: Interpolate flagged segment features ──────────────────────────
+    # Interpolate flagged segment features so they don't corrupt adjacent
+    # sequence windows. Flagged segments are still excluded from prediction
+    # by the is_flagged gate below — this only affects sequence context.
+    feat_matrix = feat_df[APNEA_FEATURE_COLS].copy()
+    if is_flagged.any():
+        feat_matrix.loc[is_flagged, :] = np.nan
+        feat_matrix = feat_matrix.interpolate(method='linear', limit_direction='both')
+        logger.info("[%s] Interpolated features for %d flagged segments "
+                    "to prevent sequence contamination",
+                    adm_id, int(is_flagged.sum()))
+
+    X_scaled = scaler.transform(feat_matrix.fillna(0.0).values.astype(float))
+    X_seq    = _build_sequences(X_scaled, TIMESTEPS)
 
     prob_col = np.full(n, np.nan)
     pred_col = np.full(n, np.nan)
@@ -587,24 +665,107 @@ def _run_one_admission(
     if len(X_seq) > 0:
         logger.info("[%s] Running model on %d sequences ...", adm_id, len(X_seq))
         
-        # ── PREDICT (supports both Keras and XGBoost) ────────────────────────
         if hasattr(model, "predict_proba"):
-            # XGBoost/LightGBM tree model
             X_seq_flat = X_seq.reshape(len(X_seq), -1)
             y_prob = model.predict_proba(X_seq_flat)[:, 1]
             logger.info("[%s] Using predict_proba for tree model", adm_id)
         else:
-            # Keras BiLSTM
             y_prob = model.predict(X_seq, verbose=0, batch_size=64).flatten()
-        
-        for j, yp in enumerate(y_prob):
-            si = j + TIMESTEPS
-            if si >= n:
-                continue
-            if is_flagged[max(0, si - TIMESTEPS):si + 1].any():
-                continue
-            prob_col[si] = yp
-            pred_col[si] = int(yp > threshold)
+
+        # ── SpO2 fusion ───────────────────────────────────────────────────────
+        # Compute per-segment directional SpO2 delta (positive = desaturation).
+        # spo2_mean vs 90th-pct baseline gives the drop magnitude; only applied
+        # when has_spo2=1. Segments without SpO2 pass through unchanged.
+        if "has_spo2" in feat_df.columns and "spo2_mean" in feat_df.columns:
+            spo2_mask = feat_df["has_spo2"].astype(float) == 1
+            if spo2_mask.any():
+                raw_baseline = float(
+                    feat_df.loc[spo2_mask, "spo2_mean"].quantile(0.95)
+                )
+                spo2_baseline = max(raw_baseline, 97.0)
+            else:
+                spo2_baseline = 97.0
+
+            # Store raw ECG-only probability for audit before fusion
+            feat_df["xgb_prob_raw"] = np.nan
+
+            def _fuse(ecg_prob: float, seg_idx: int) -> float:
+                """
+                Adjust ECG probability using SpO2 evidence.
+                - has_spo2=0 → unchanged (no penalty for missing data)
+                - desaturation ≥3% → boost (AASM apnea criterion threshold)
+                - desaturation 1.5-3% → mild boost
+                - SpO2 rising → suppress (contradicts apnea hypothesis)
+                - flat SpO2 → mild suppress ONLY for borderline ECG predictions
+                Adjustment scales with ECG uncertainty — maximum effect at
+                prob=0.5, near-zero effect at prob=0.0 or prob=1.0.
+                """
+                if seg_idx >= len(feat_df):
+                    return ecg_prob
+                row_s = feat_df.iloc[seg_idx]
+                if int(float(row_s.get("has_spo2", 0))) == 0:
+                    return ecg_prob   # no SpO2 — ECG stands alone
+
+                # Positive delta = SpO2 dropped below patient baseline
+                delta = spo2_baseline - float(row_s.get("spo2_mean", spo2_baseline))
+
+                # Scale by ECG uncertainty: 1.0 at threshold, 0.0 at certainty
+                uncertainty = 1.0 - abs(ecg_prob - 0.5) * 2.0
+
+                if delta >= 4.0:
+                    adj = +0.12 * uncertainty   # significant desaturation
+                elif delta >= 3.0:
+                    adj = +0.06 * uncertainty   # borderline — small boost only
+                elif delta <= -1.5:
+                    adj = -0.08 * uncertainty   # SpO2 clearly rising — suppress
+                else:
+                    # Flat SpO2 during a predicted apnea event is mild contradicting evidence
+                    # only suppress if ECG confidence is low (near threshold)
+                    # High-confidence ECG predictions (prob > 0.75) are not touched
+                    if ecg_prob < 0.70:
+                        adj = -0.06 * uncertainty
+                    else:
+                        adj = 0.0
+
+                return float(np.clip(ecg_prob + adj, 0.0, 1.0))
+
+            n_fused_up   = 0
+            n_fused_down = 0
+
+            for j, yp in enumerate(y_prob):
+                si = j + TIMESTEPS
+                if si >= n:
+                    continue
+                if is_flagged[max(0, si - TIMESTEPS):si + 1].any():
+                    continue
+
+                feat_df.at[feat_df.index[si], "xgb_prob_raw"] = yp
+                fused = _fuse(yp, si)
+
+                if fused > yp + 0.01:
+                    n_fused_up += 1
+                elif fused < yp - 0.01:
+                    n_fused_down += 1
+
+                prob_col[si] = fused
+                pred_col[si] = int(fused > threshold)
+
+            logger.info(
+                "[%s] SpO2 fusion: baseline=%.1f%%  boosted=%d  suppressed=%d  "
+                "no-SpO2 unchanged=%d",
+                adm_id, spo2_baseline, n_fused_up, n_fused_down,
+                int((feat_df["has_spo2"].astype(float) == 0).sum()),
+            )
+        else:
+            # No SpO2 columns in CSV — original path unchanged
+            for j, yp in enumerate(y_prob):
+                si = j + TIMESTEPS
+                if si >= n:
+                    continue
+                if is_flagged[max(0, si - TIMESTEPS):si + 1].any():
+                    continue
+                prob_col[si] = yp
+                pred_col[si] = int(yp > threshold)
     else:
         logger.warning(
             "[%s] Only %d segments — LSTM needs ≥%d for any predictions.",
@@ -632,6 +793,26 @@ def _run_one_admission(
     # Use timestamp-derived duration for AHI denominator
     dur_min   = _recording_duration_min(adm_df, n)
     ahi_proxy = n_apnea / max(dur_min / 60.0, 1e-6)
+
+    # ── Log fusion impact ─────────────────────────────────────────────────────
+    if "xgb_prob_raw" in feat_df.columns:
+        raw_apnea = int((feat_df["xgb_prob_raw"] > threshold).sum())
+        if raw_apnea != n_apnea:
+            logger.info(
+                "[%s] SpO2 fusion changed apnea count: %d → %d  "
+                "(AHI change: %.1f → %.1f /hr)",
+                adm_id, raw_apnea, n_apnea,
+                raw_apnea / max(dur_min / 60.0, 1e-6),
+                ahi_proxy,
+            )
+    else:
+        logger.info(
+            "[%s] SpO2 fusion: apnea count unchanged (%d)  "
+            "(SpO2 available in %.0f%% of segments)",
+            adm_id, n_apnea,
+            100.0 * (feat_df["has_spo2"].astype(float) == 1).sum() / max(n, 1)
+        )
+
     mean_prob = float(np.nanmean(prob_col))
     severity  = ("Normal"       if ahi_proxy < 5  else
                  "Mild OSA"     if ahi_proxy < 15 else
@@ -646,7 +827,8 @@ def _run_one_admission(
             logger.info(
                 "  seg=%3d  t=%s  prob=%.3f  ecg_hr=%.1f  ref_hr=%.1f  "
                 "resp=%.1f bpm  spo2_mean=%.1f  has_spo2=%d  rhythm=%s  src=%dHz",
-                int(r["segment_idx"]), r.get("timestamp", ""),
+                int(r["segment_idx"]),
+                _fmt_ts_ist(r.get("timestamp", "")),
                 r["apnea_prob"], r.get("ecg_hr_bpm", 0.0),
                 r.get("ref_hr_bpm", float("nan")),
                 r.get("resp_rate_bpm", 0.0),

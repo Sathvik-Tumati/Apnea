@@ -139,6 +139,24 @@ SPO2_FEATURE_COLS = [
     "spo2_mean", "spo2_min", "spo2_delta_index",
     "odi", "t90", "spo2_approx_entropy",
 ]
+SPO2_RAW_COLS = [f"spo2Data[{i}]" for i in range(SAMPLES_SPO2_SEG)]
+
+# Timezone for human-readable log output
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _fmt_ts_ist(ts_raw) -> str:
+    """Convert a raw UTC timestamp (str, Timestamp, datetime, or None) to
+    an IST string suitable for log output.  Always safe — returns the raw
+    value stringified on any parse failure, never raises."""
+    if ts_raw is None or (isinstance(ts_raw, str) and not ts_raw.strip()):
+        return ""
+    try:
+        ts = pd.Timestamp(ts_raw)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return str(ts_raw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -744,17 +762,22 @@ def build_segment_csv(
         if spo2_start is not None and has_spo2_global:
             spo2_end = spo2_start + SAMPLES_SPO2_SEG
             if spo2_end <= len(spo2_signal):
+                spo2_seg = spo2_signal[spo2_start:spo2_end]
                 spo2_feats = _compute_spo2_features(
-                    spo2_signal[spo2_start:spo2_end],
+                    spo2_seg,
                     baseline_override=global_spo2_baseline)
             elif spo2_start < len(spo2_signal):
+                spo2_seg = spo2_signal[spo2_start:]
                 spo2_feats = _compute_spo2_features(
-                    spo2_signal[spo2_start:],
+                    spo2_seg,
                     baseline_override=global_spo2_baseline)
+                spo2_seg = np.pad(spo2_seg, (0, SAMPLES_SPO2_SEG - len(spo2_seg)), constant_values=np.nan)
             else:
                 spo2_feats = dict(_SPO2_DEFAULTS)
+                spo2_seg = np.full(SAMPLES_SPO2_SEG, np.nan)
         else:
             spo2_feats = dict(_SPO2_DEFAULTS)
+            spo2_seg = np.full(SAMPLES_SPO2_SEG, np.nan)
 
         if spo2_feats["has_spo2"] == 1:
             n_spo2_segs += 1
@@ -773,6 +796,7 @@ def build_segment_csv(
             row[f"analysis.segments[{i}].rhythm_label"]      = ""
             row[f"analysis.segments[{i}].ectopy_label"]      = ""
         row.update(spo2_feats)
+        row.update(dict(zip(SPO2_RAW_COLS, np.round(spo2_seg.astype(float), 2).tolist())))
         row.update(dict(zip(ECG_COLS, np.round(seg.astype(float), 6).tolist())))
         rows.append(row)
 
@@ -790,6 +814,7 @@ def build_segment_csv(
          "analysis.background_rhythm"]
         + HR_COLS + RHYTHM_COLS + ECTOPY_COLS
         + SPO2_FEATURE_COLS + ["has_spo2"]
+        + SPO2_RAW_COLS
         + ECG_COLS
     )
     for c in fixed_cols:
@@ -1123,7 +1148,9 @@ def extract_apnea_events(
         if pd.notna(ts_raw) and str(ts_raw).strip():
             parsed = pd.to_datetime(ts_raw, utc=True, errors="coerce")
             if pd.notna(parsed):
-                event_ts = parsed.isoformat()
+                event_ts = parsed.isoformat()   # always stored as UTC ISO for Supabase
+                logger.debug("[EVENTS] apnea event at %s (IST: %s)",
+                             event_ts, _fmt_ts_ist(ts_raw))
         events.append({
             "admission_id":    admission_id,
             "model_source":    model_source,
@@ -1211,7 +1238,9 @@ def write_results_to_supabase(
         "validation_unconfirmed":    summary.get("validation_unconfirmed"),
         "validation_mean_score":     summary.get("validation_mean_score"),
         "physiologically_supported": summary.get("physiologically_supported"),
-    }
+        "spo2_coverage_pct":         summary.get("spo2_coverage_pct"),
+
+    }   
     try:
         (supabase_client.table(RESULTS_TABLE)
          .upsert(record, on_conflict="admission_id")

@@ -17,6 +17,7 @@ For deep dives into the technical architecture and logic, see the `docs/` direct
 - [**Model Architecture**](docs/architecture.md): BiLSTM and XGBoost model details, modality flags, and modality dropout.
 - [**Feature Engineering**](docs/feature_engineering.md): Details on all 30 features extracted per segment.
 - [**Sleep Detection**](docs/sleep_detection.md): How `ecg_sleep_filter.py` isolates sleep-only epochs before inference.
+- [**Apnea Validator**](docs/apnea_validator.md): Full technical reference for `apnea_validator.py` — scoring logic, constants, output columns, dual-mechanism primary criterion, and calibration guide.
 
 ---
 
@@ -40,7 +41,8 @@ project2/
 │   ├── mongo_infer.py            # MongoDB → ECG+SpO2 → Sleep filter → Inference → Supabase
 │   └── ecg_sleep_filter.py       # ECG-only sleep detection (IST time gate + HRV scoring)
 ├── docs/                         # Technical documentation
-├── apnea_validator.py            # Post-inference physiological plausibility validator ← NEW
+├── apnea_validator.py            # Post-inference physiological plausibility validator
+├── spo2_split_ahi.py             # Diagnostic: per-window SpO2-aware AHI breakdown
 ├── apnea_model.keras             # BiLSTM saved model
 ├── apnea_best.keras              # BiLSTM best checkpoint (highest val AUC)
 ├── apnea_scaler.pkl              # BiLSTM fitted StandardScaler (30 features)
@@ -106,24 +108,24 @@ python automation/mongo_infer.py --admission ADM1819906487 --write-supabase --re
 
 ## Post-Inference Validation
 
-After inference, run the physiological plausibility validator to verify model predictions against cardiorespiratory physiology:
+After inference, run the physiological plausibility validator to cross-check every model prediction against the patient's actual cardiorespiratory physiology. This is the "second opinion" layer that separates false positives from real apnea events.
 
 ```bash
-# Validate predictions for one admission (reads the infer_results CSV)
+# Validate predictions (reads the infer_results CSV, outputs a validated CSV)
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv
 
-# Verbose mode — shows per-event score breakdown
+# Verbose mode — prints a full per-event score breakdown to the log
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
     --verbose
 
-# Save validated CSV (adds validation_score, verdict, spo2_drop_pct columns)
+# Specify a custom output path for the validated CSV
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
-    --out   infer_output/ADM1819906487/validated_results.csv
+    --out   infer_output/ADM1819906487/ADM1819906487_validated.csv
 
-# Update Supabase with validation results
+# Write validation results back to Supabase
 python apnea_validator.py \
     --infer infer_output/ADM1819906487/infer_results_ADM1819906487.csv \
     --write-supabase
@@ -133,18 +135,60 @@ python apnea_validator.py \
 
 | Criterion | Weight | What it checks |
 |---|---|---|
-| HR/RR ratio pattern | 40 pts | RR interval increases + HR spike at termination |
-| SpO2 desaturation | 35 pts | ≥3% drop within ±2 segments of event (accounts for circulation lag) |
+| **Primary — Combined** (max of two mechanisms, see below) | 40 pts | Whichever of the two mechanisms scores higher is used |
+| SpO2 desaturation | 35 pts | ≥3% drop within ±2 segments of event (checks both `spo2_min` and `spo2_mean`) |
 | Respiratory suppression | 15 pts | EDR resp amplitude drop + elevated rate variability |
-| HR dip-surge pattern | 10 pts | Classic bradycardia during apnea → tachycardia at termination |
+| HR dip-surge (fallback) | 10 pts | Classic bradycardia during apnea → tachycardia at termination |
+
+**Primary criterion — dual mechanism (Criterion 1):**
+
+The primary criterion computes **both** of the following mechanisms for every event and uses the **higher score**:
+
+- **HR/RespRate ratio**: During apnea, respiratory rate falls toward zero while HR stays elevated (sympathetic arousal). The ratio HR÷RespRate rises sharply. A ≥15% ratio increase scores partial credit; ≥80% increase scores full credit. Requires ≥2 valid pre-event baseline segments — returns `NA` if insufficient data.
+
+- **HR drop/surge**: Classic vagal bradycardia during apnea (HR ≥3 bpm below pre-event baseline) followed by sympathetic tachycardia at termination (HR ≥4 bpm surge in the following segment). Always computed when baseline and event HR exist.
+
+The `method_used` field in the output CSV records which mechanism won (`"ratio"`, `"hr_drop"`, `"both"`, or `"neither"`). Both computed values are shown in `--verbose` output regardless of which one won, so you can audit the scoring.
+
+**Handling missing data:**
+- **Dynamic scoring**: If SpO2 is structurally unavailable (`has_spo2=0` for both baseline and event windows), its 35 points are redistributed proportionally across the other three criteria so the maximum achievable score stays at 100 — not 65.
+- **Cluster surge bonus**: When back-to-back apnea events form a dense cluster, the heart has no time to recover between events. The validator searches for a single HR recovery surge at the **first clean segment after the cluster ends**. If found, every event in the cluster gets +8 points (capped at 59 — the bonus alone can never push a verdict to CONFIRMED).
+
+**Data completeness flags:**
+
+Events scoring below 60 are tagged with a `data_completeness` flag that tells reviewers *why* they failed:
+
+| Flag | Meaning |
+|---|---|
+| `complete` | All data was available — the event genuinely lacks physiological support |
+| `insufficient_spo2` | SpO2 sensor was unavailable; SpO2 check could not be performed |
+| `insufficient_trailing` | Recording ended before the post-cluster recovery window; surge search incomplete |
+| `insufficient_both` | Both SpO2 and trailing window were unavailable |
+
+**AHI range reporting (temporary):**
+
+Because events flagged as data-incomplete may be real events the validator simply couldn't check, AHI is reported as a **range**:
+- **Lower bound** (`validated_ahi`): CONFIRMED + PROBABLE events only.
+- **Upper bound** (`validated_ahi_upper`): Adds all data-incomplete UNCERTAIN/UNCONFIRMED events as if they were real.
+
+If the upper bound crosses a severity threshold the lower bound doesn't, the system logs a flag recommending manual review before finalizing the severity classification.
 
 **Verdicts:**
 - `✓ CONFIRMED` (≥60) — strong physiological support
-- `~ PROBABLE` (40–59) — partial support, review recommended  
-- `? UNCERTAIN` (20–39) — weak support, may be artifact
-- `✗ UNCONFIRMED` (<20) — no physiological support, likely false positive
+- `~ PROBABLE` (40–59) — partial support, manual review recommended
+- `? UNCERTAIN` (20–39) — weak support, likely artifact
+- `✗ UNCONFIRMED` (<20) — no physiological support, likely a false positive
 
-The **validated AHI** (CONFIRMED + PROBABLE events only) is a more conservative estimate than the raw model AHI.
+**SpO2-aware AHI breakdown (diagnostic):**
+
+When SpO2 sensor dropout and apnea events coincide, a single blended AHI can be misleading. Use `spo2_split_ahi.py` to split the recording into contiguous SpO2-available / dropout windows and report raw + validated AHI for each:
+
+```bash
+python spo2_split_ahi.py \
+    --validated infer_output/ADM1819906487/ADM1819906487_validated.csv
+```
+
+This is a standalone diagnostic — it does not modify any files.
 
 ---
 
@@ -246,6 +290,7 @@ CREATE TABLE IF NOT EXISTS apnea_results (
 -- Run this ALTER after creating the table to add validation columns:
 ALTER TABLE apnea_results
     ADD COLUMN IF NOT EXISTS validated_ahi             FLOAT,
+    ADD COLUMN IF NOT EXISTS validated_ahi_upper       FLOAT,   -- upper bound (includes data-incomplete events)
     ADD COLUMN IF NOT EXISTS validation_confirmed      INT,
     ADD COLUMN IF NOT EXISTS validation_probable       INT,
     ADD COLUMN IF NOT EXISTS validation_uncertain      INT,
@@ -262,11 +307,36 @@ After each run, `infer_output/<admissionId>/` contains:
 
 | File | Contents |
 |---|---|
-| `ADM*_segments.csv` | Sleep-filtered, feature-enriched segment CSV |
+| `ADM*_segments.csv` | Sleep-filtered, feature-enriched segment CSV (includes `spo2Data[0..29]` raw array) |
 | `ADM*_sleep_windows.csv` | Sleep detection results (is_sleep, window_id, HR, SDNN) |
-| `infer_results_ADM*.csv` | Per-segment model predictions and features |
+| `infer_results_ADM*.csv` | Per-segment XGBoost predictions and features |
+| `bilstm/infer_results_ADM*.csv` | Per-segment BiLSTM predictions |
 | `infer_summary.csv` | One row per admission: AHI, severity, duration, etc. |
 | `infer_summary.txt` | Human-readable clinical summary |
+| `ADM*_validated.csv` | Inference results with validation columns appended (see below) |
+
+**Validated CSV columns** (added by `apnea_validator.py`):
+
+| Column | Type | Description |
+|---|---|---|
+| `validation_score` | float | Final 0–100 score for this segment |
+| `validation_verdict` | str | `CONFIRMED` / `PROBABLE` / `UNCERTAIN` / `UNCONFIRMED` |
+| `method_used` | str | Which primary mechanism won: `ratio`, `hr_drop`, `both`, or `neither` |
+| `ratio_score` | float | Score from the HR/RespRate ratio mechanism (0–40) |
+| `ratio_baseline` | float | Pre-event HR/RespRate baseline ratio |
+| `ratio_event` | float | HR/RespRate ratio at the event segment |
+| `ratio_increase_pct` | float | % increase in ratio vs. baseline |
+| `hr_drop_score` | float | Score from the HR drop/surge mechanism (0–40) |
+| `hr_drop_bpm` | float | Actual HR drop in bpm (NaN if not computable) |
+| `hr_dropped` | bool | True if HR fell ≥3 bpm below baseline |
+| `hr_surged` | bool | True if HR rose ≥4 bpm in the following segment |
+| `spo2_drop_pct` | float | SpO2 drop magnitude in % |
+| `spo2_available` | bool | True if SpO2 data existed in the baseline or event window |
+| `resp_suppressed` | bool | True if resp amplitude dropped ≥15% below baseline |
+| `hr_dip_confirmed` | bool | True if fallback dip criterion confirmed |
+| `hr_surge_confirmed` | bool | True if fallback surge criterion confirmed |
+| `cluster_bonus_applied` | bool | True if a cluster-level recovery surge bonus was added |
+| `data_completeness` | str | `complete` / `insufficient_spo2` / `insufficient_trailing` / `insufficient_both` |
 
 ---
 

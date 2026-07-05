@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>ECG Apnea Verification Dashboard</title>
+  <meta name="description" content="Clinical verification dashboard for ECG-based sleep apnea detection pipeline."/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body,#root{height:100%;overflow:hidden}
+    body{background:#060b16;color:#e2e8f0;font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+    ::-webkit-scrollbar{width:5px;height:5px}
+    ::-webkit-scrollbar-track{background:#0a1020}
+    ::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:3px}
+    ::-webkit-scrollbar-thumb:hover{background:#2d5280}
+    button{font-family:inherit;cursor:pointer}
+    input[type="range"]{-webkit-appearance:none;appearance:none;background:#1e2d4a;border-radius:4px;height:4px;cursor:pointer}
+    input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#3b82f6;cursor:pointer}
+    input[type="text"]{font-family:inherit;outline:none}
+    .spin{animation:spin 1s linear infinite;display:inline-block}
+    @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+    .fi{animation:fi 0.25s ease}
+    @keyframes fi{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+    canvas{display:block}
+    table{border-collapse:collapse}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+// ── Imports ─────────────────────────────────────────────────────────────────
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'https://esm.sh/react@18.3.1';
+import { createRoot } from 'https://esm.sh/react-dom@18.3.1/client';
+import htm from 'https://esm.sh/htm@3.1.1';
+import { LineChart, Line, AreaChart, Area, ComposedChart, XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  ReferenceLine, ReferenceArea } from 'https://esm.sh/recharts@2.13.0?deps=react@18.3.1,react-dom@18.3.1';
+
+const h = htm.bind(React.createElement);
+const render = (el, root) => createRoot(root).render(el);
+
+// ── IST utilities ─────────────────────────────────────────────────────────────
+const IST = { timeZone: 'Asia/Kolkata', hour12: false };
+const toISTShort = r => {
+  try { const d = new Date(r); if (isNaN(d)) return String(r);
+    return d.toLocaleString('en-IN',{...IST,hour:'2-digit',minute:'2-digit',second:'2-digit'})+' IST'; }
+  catch { return String(r); }
+};
+const toISTFull = r => {
+  if (!r && r !== 0) return '—';
+  try { const d = new Date(r); if (isNaN(d)) return String(r);
+    return d.toLocaleString('en-IN',{...IST,year:'numeric',month:'2-digit',day:'2-digit',
+      hour:'2-digit',minute:'2-digit',second:'2-digit'})+' IST'; }
+  catch { return String(r); }
+};
+
+// ── Signal processing ─────────────────────────────────────────────────────────
+function detectRPeaks(ecg, fs=125) {
+  const N=ecg.length; if(N<30)return[];
+  let s=0,s2=0;
+  for(let i=0;i<N;i++){s+=ecg[i];s2+=ecg[i]*ecg[i];}
+  const mean=s/N,std=Math.sqrt(Math.max(0,s2/N-mean*mean));
+  const thr=mean+0.55*std,minD=Math.round(0.27*fs);
+  const peaks=[];
+  for(let i=2;i<N-2;i++){
+    if(ecg[i]>=thr&&ecg[i]>=ecg[i-1]&&ecg[i]>=ecg[i+1]&&ecg[i]>=ecg[i-2]&&ecg[i]>=ecg[i+2])
+      if(peaks.length===0||i-peaks[peaks.length-1]>=minD) peaks.push(i);
+  }
+  return peaks;
+}
+function computeEDR(ecg,peaks,fs=125){
+  if(peaks.length<2)return{t:[],v:[]};
+  const totalS=ecg.length/fs;
+  const pt=peaks.map(p=>p/fs);
+  const pv=peaks.map(p=>{
+    const lo=Math.max(0,p-15),hi=Math.min(ecg.length-1,p+15);
+    let mx=-Infinity,mn=Infinity;
+    for(let i=lo;i<=hi;i++){if(ecg[i]>mx)mx=ecg[i];if(ecg[i]<mn)mn=ecg[i];}
+    return mx-mn;
+  });
+  const respFs=4,n=Math.round(totalS*respFs),t=[],v=[];
+  for(let i=0;i<n;i++){
+    const ti=i/respFs; t.push(ti);
+    if(ti<=pt[0]){v.push(pv[0]);continue;}
+    if(ti>=pt[pt.length-1]){v.push(pv[pv.length-1]);continue;}
+    let j=0; while(j<pt.length-1&&pt[j+1]<ti)j++;
+    v.push(pv[j]*(1-(ti-pt[j])/(pt[j+1]-pt[j]))+pv[j+1]*((ti-pt[j])/(pt[j+1]-pt[j])));
+  }
+  return{t,v};
+}
+
+// ── CSV parser via Web Worker ─────────────────────────────────────────────────
+const WSRC=`importScripts('https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js');
+self.onmessage=function(e){
+  const{file,ftype}=e.data; const rows=[]; const ecgMap=Object.create(null); let count=0;
+  Papa.parse(file,{header:true,dynamicTyping:true,skipEmptyLines:true,
+    step:function(r){const row=r.data;count++;
+      if(ftype==='segments'){
+        const ecg=new Float32Array(3750);
+        for(let i=0;i<3750;i++){ecg[i]=row['ecgData['+i+']']||0;delete row['ecgData['+i+']'];}
+        ecgMap[String(row.segment_idx)]=ecg;rows.push(row);
+        if(count%100===0)self.postMessage({type:'progress',n:count});
+      }else{rows.push(row);}
+    },
+    complete:function(){
+      if(ftype==='segments'){
+        const bufs=Object.values(ecgMap).map(a=>a.buffer);
+        self.postMessage({type:'done',rows,ecgMap},bufs);
+      }else{self.postMessage({type:'done',rows});}
+    },
+    error:function(err){self.postMessage({type:'err',msg:err.message});}
+  });
+};`;
+function parseCSV(file,ftype,onProg){
+  return new Promise((res,rej)=>{
+    let worker;
+    try{const blob=new Blob([WSRC],{type:'application/javascript'});worker=new Worker(URL.createObjectURL(blob));}
+    catch(_){
+      import('https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js').then(()=>{
+        Papa.parse(file,{header:true,dynamicTyping:true,skipEmptyLines:true,
+          complete:r=>res({rows:r.data,ecgMap:null}),error:e=>rej(e)});
+      });return;
+    }
+    worker.onmessage=e=>{
+      if(e.data.type==='progress')onProg&&onProg(e.data.n);
+      else if(e.data.type==='done'){worker.terminate();res(e.data);}
+      else if(e.data.type==='err'){worker.terminate();rej(new Error(e.data.msg));}
+    };
+    worker.onerror=e=>{worker.terminate();rej(e);};
+    worker.postMessage({file,ftype});
+  });
+}
+
+// ── Severity ──────────────────────────────────────────────────────────────────
+const SEV={'Normal':'#22c55e','Mild OSA':'#eab308','Moderate OSA':'#f97316','Severe OSA':'#ef4444'};
+const sevC=s=>SEV[s]||'#64748b';
+const sevBg=s=>sevC(s)+'18';
+const ahiSev=a=>a<5?'Normal':a<15?'Mild OSA':a<30?'Moderate OSA':'Severe OSA';
+
+// ── Primitives ────────────────────────────────────────────────────────────────
+const CS={contentStyle:{background:'#0c1526',border:'1px solid #2d3f5c',borderRadius:8,fontSize:11},labelStyle:{color:'#94a3b8',fontSize:10}};
+
+function Card({children,style={}}){
+  return h('div',{style:{background:'#0c1526',border:'1px solid #1a2d4d',borderRadius:10,padding:'14px 18px',...style}},children);
+}
+function Lbl({children}){
+  return h('div',{style:{color:'#475569',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:6}},children);
+}
+function Empty({msg}){
+  return h('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',height:'100%',minHeight:200,flexDirection:'column',gap:10,color:'#1e3a5f',border:'1px dashed #1a2d4d',borderRadius:10,margin:20}},
+    h('span',{style:{fontSize:28}},'📂'),
+    h('span',{style:{fontSize:12}},msg||'File not loaded'));
+}
+function St({label,value,unit,color,mono}){
+  return h('div',{style:{background:'#0c1526',border:'1px solid #1a2d4d',borderRadius:8,padding:'12px 16px',flex:1,minWidth:90}},
+    h('div',{style:{color:'#334155',fontSize:9,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.07em',marginBottom:5}},label),
+    h('div',{style:{color:color||'#e2e8f0',fontSize:22,fontWeight:700,fontFamily:mono?'JetBrains Mono':'inherit',lineHeight:1}},
+      value??'—',
+      unit&&value!=null?h('span',{style:{fontSize:11,fontWeight:400,color:'#334155',marginLeft:3}},unit):null
+    ));
+}
+function SevBadge({s}){
+  return h('span',{style:{display:'inline-flex',alignItems:'center',gap:6,background:sevBg(s),color:sevC(s),border:`1px solid ${sevC(s)}40`,borderRadius:20,padding:'4px 14px',fontSize:13,fontWeight:700}},
+    h('span',{style:{width:7,height:7,borderRadius:'50%',background:sevC(s)}}),s||'—');
+}
+
+// ── Upload zone ───────────────────────────────────────────────────────────────
+const FDEFS=[
+  {key:'segments',   label:'ADM_segments.csv', file:'ADM_segments.csv'},
+  {key:'inferXgb',  label:'infer_results_ADM.csv', file:'infer_results_ADM.csv'},
+  {key:'inferBL',   label:'bilstm_infer_results.csv', file:'bilstm_infer_results.csv'},
+  {key:'sleep',     label:'sleep_windows.csv', file:'sleep_windows.csv'},
+  {key:'summary',   label:'infer_summary.csv', file:'infer_summary.csv'},
+];
+function UploadZone({onLoad, st, setSt, pg, setPg, handle}){
+  const [drag,setDrag]=useState(false);
+  const onDrop=useCallback(e=>{
+    e.preventDefault();setDrag(false);
+    Array.from(e.dataTransfer.files).forEach(f=>{
+      const n=f.name.toLowerCase();
+      if(n.includes('segment'))handle(f,'segments');
+      else if(n.includes('summary'))handle(f,'summary');
+      else if(n.includes('sleep'))handle(f,'sleep');
+      else if(n.includes('bilstm')||n.includes('bi_lstm'))handle(f,'inferBL');
+      else if(n.includes('infer')||n.includes('result'))handle(f,'inferXgb');
+    });
+  },[handle]);
+  return h('div',{
+    onDrop,
+    onDragOver:e=>{e.preventDefault();setDrag(true);},
+    onDragLeave:()=>setDrag(false),
+    style:{background:drag?'#0d1e36':'#08111f',borderBottom:'1px solid #1a2d4d',padding:'9px 18px',
+      display:'flex',gap:8,flexWrap:'wrap',alignItems:'center',transition:'background 0.2s',flexShrink:0}},
+    h('span',{style:{color:'#1e3a5f',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.06em',marginRight:4}},'CSV FILES'),
+    ...FDEFS.map(({key,label})=>{
+      const s=st[key];
+      const col=s==='ok'?'#22c55e':s==='loading'?'#3b82f6':s==='err'?'#ef4444':'#1e3a5f';
+      return h('label',{key,style:{cursor:'pointer'}},
+        h('input',{type:'file',accept:'.csv',style:{display:'none'},
+          onChange:e=>e.target.files[0]&&handle(e.target.files[0],key)}),
+        h('div',{style:{display:'flex',alignItems:'center',gap:5,background:col+'12',border:`1px solid ${col}30`,
+          borderRadius:6,padding:'5px 10px',fontSize:11,color:col,whiteSpace:'nowrap'}},
+          s==='loading'?h('span',{className:'spin'},'⟳'):s==='ok'?'✓':s==='err'?'✗':'+',
+          h('span',null,label),
+          s==='loading'&&pg[key]>0?h('span',{style:{color:col+'80',fontSize:9}},pg[key]):null
+        ));
+    }),
+    drag?h('span',{style:{color:'#3b82f6',fontSize:11,marginLeft:4}},'Drop CSVs here…'):null
+  );
+}
+
+// ── Tab bar ───────────────────────────────────────────────────────────────────
+const TABS=[{icon:'📊',label:'Overview'},{icon:'💓',label:'ECG Viewer'},{icon:'🌙',label:'Sleep Filter'},{icon:'⚡',label:'Models'},{icon:'📋',label:'Segments'}];
+function TabBar({active,onSelect}){
+  return h('div',{style:{display:'flex',background:'#08111f',borderBottom:'1px solid #1a2d4d',padding:'0 14px',flexShrink:0}},
+    ...TABS.map((t,i)=>h('button',{
+      key:i,onClick:()=>onSelect(i),
+      style:{background:'none',border:'none',borderBottom:`2px solid ${active===i?'#3b82f6':'transparent'}`,
+        color:active===i?'#60a5fa':'#334155',padding:'9px 14px',fontSize:11,fontWeight:700,
+        textTransform:'uppercase',letterSpacing:'0.05em',cursor:'pointer',display:'flex',
+        alignItems:'center',gap:5,transition:'all 0.15s',whiteSpace:'nowrap'}},
+      h('span',null,t.icon),h('span',null,t.label))));
+}
+
+// ── ECG canvas ────────────────────────────────────────────────────────────────
+function ECGCanvas({ecg,peaks}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const cv=ref.current; if(!cv||!ecg?.length)return;
+    const dpr=window.devicePixelRatio||1;
+    const W=cv.clientWidth,H=cv.clientHeight;
+    cv.width=W*dpr;cv.height=H*dpr;
+    const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
+    const P={t:18,r:16,b:28,l:50},pW=W-P.l-P.r,pH=H-P.t-P.b,N=ecg.length;
+    ctx.fillStyle='#080f1e';ctx.fillRect(0,0,W,H);
+    // minor grid
+    ctx.strokeStyle='#0c1828';ctx.lineWidth=0.4;
+    for(let i=0;i<=30;i++){const x=P.l+(i/30)*pW;ctx.beginPath();ctx.moveTo(x,P.t);ctx.lineTo(x,P.t+pH);ctx.stroke();}
+    for(let i=0;i<=8;i++){const y=P.t+(i/8)*pH;ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(P.l+pW,y);ctx.stroke();}
+    // 5s marks
+    ctx.strokeStyle='#131f38';ctx.lineWidth=0.8;
+    for(let i=0;i<=6;i++){const x=P.l+(i/6)*pW;ctx.beginPath();ctx.moveTo(x,P.t);ctx.lineTo(x,P.t+pH);ctx.stroke();}
+    ctx.fillStyle='#1e3a5f';ctx.font='9px Inter';ctx.textAlign='center';
+    for(let i=0;i<=6;i++)ctx.fillText((i*5)+'s',P.l+(i/6)*pW,H-5);
+    ctx.fillText('Time (seconds)',W/2,H-0.5);
+    // amplitude range
+    let mn=Infinity,mx=-Infinity;
+    for(let i=0;i<N;i++){if(ecg[i]<mn)mn=ecg[i];if(ecg[i]>mx)mx=ecg[i];}
+    const pad=(mx-mn)*0.1||0.5,lo=mn-pad,hi=mx+pad,rng=hi-lo;
+    ctx.textAlign='right';
+    for(let i=0;i<=4;i++){const v=lo+(i/4)*rng,y=P.t+pH-(i/4)*pH;ctx.fillText(v.toFixed(2),P.l-5,y+3);}
+    // ECG trace
+    ctx.strokeStyle='#00e676';ctx.lineWidth=1.3;ctx.shadowColor='#00e67640';ctx.shadowBlur=4;
+    ctx.beginPath();
+    for(let i=0;i<N;i++){const x=P.l+(i/(N-1))*pW,y=P.t+pH-((ecg[i]-lo)/rng)*pH;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
+    ctx.stroke();ctx.shadowBlur=0;
+    // R-peaks
+    if(peaks?.length){ctx.fillStyle='#ff4444';peaks.forEach(p=>{const x=P.l+(p/(N-1))*pW,y=P.t+pH-((ecg[p]-lo)/rng)*pH;ctx.beginPath();ctx.arc(x,y,3.5,0,Math.PI*2);ctx.fill();});}
+  },[ecg,peaks]);
+  return h('canvas',{ref,style:{width:'100%',height:'100%'}});
+}
+
+// ── EDR canvas ────────────────────────────────────────────────────────────────
+function EDRCanvas({edr}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const cv=ref.current; if(!cv||!edr?.v?.length)return;
+    const dpr=window.devicePixelRatio||1;
+    const W=cv.clientWidth,H=cv.clientHeight;
+    cv.width=W*dpr;cv.height=H*dpr;
+    const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
+    ctx.fillStyle='#080f1e';ctx.fillRect(0,0,W,H);
+    const P={t:8,r:16,b:22,l:50},pW=W-P.l-P.r,pH=H-P.t-P.b;
+    const{t,v}=edr,N=v.length;
+    let mn=Infinity,mx=-Infinity;v.forEach(x=>{if(x<mn)mn=x;if(x>mx)mx=x;});
+    const rng=mx-mn||1;
+    ctx.strokeStyle='#7c3aed';ctx.lineWidth=1.5;ctx.shadowColor='#7c3aed40';ctx.shadowBlur=4;
+    ctx.beginPath();
+    for(let i=0;i<N;i++){const x=P.l+(t[i]/30)*pW,y=P.t+pH-((v[i]-mn)/rng)*pH;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
+    ctx.stroke();ctx.shadowBlur=0;
+    ctx.fillStyle='#1e3a5f';ctx.font='9px Inter';ctx.textAlign='center';
+    for(let i=0;i<=6;i++)ctx.fillText((i*5)+'s',P.l+(i/6)*pW,H-3);
+  },[edr]);
+  return h('canvas',{ref,style:{width:'100%',height:'100%'}});
+}
+
+// ── Prob gauge ────────────────────────────────────────────────────────────────
+function ProbGauge({prob,threshold=0.55}){
+  const p=typeof prob==='number'&&!isNaN(prob)?Math.min(1,Math.max(0,prob)):0;
+  const col=p>=threshold?'#ef4444':'#22c55e';
+  const range=240,start=210;
+  const arc=pct=>{const ang=(start-pct*range)*(Math.PI/180);return{x:65+52*Math.cos(ang),y:70-52*Math.sin(ang)};};
+  const a0=arc(0),ap=arc(p),at=arc(threshold),lg=p*range>180?1:0;
+  return h('div',{style:{textAlign:'center'}},
+    h('svg',{width:130,height:92,viewBox:'0 0 130 92'},
+      h('path',{d:`M ${a0.x} ${a0.y} A 52 52 0 1 1 ${arc(1).x} ${arc(1).y}`,fill:'none',stroke:'#1a2d4d',strokeWidth:9,strokeLinecap:'round'}),
+      p>0.002?h('path',{d:`M ${a0.x} ${a0.y} A 52 52 0 ${lg} 1 ${ap.x} ${ap.y}`,fill:'none',stroke:col,strokeWidth:9,strokeLinecap:'round'}):null,
+      h('circle',{cx:at.x,cy:at.y,r:5,fill:'#eab308'}),
+      h('text',{x:65,y:62,textAnchor:'middle',fill:col,fontSize:20,fontWeight:800,fontFamily:'JetBrains Mono'},p.toFixed(3)),
+      h('text',{x:65,y:75,textAnchor:'middle',fill:'#334155',fontSize:8},'APNEA PROB'),
+      h('text',{x:65,y:85,textAnchor:'middle',fill:'#1e3a5f',fontSize:7},'● '+threshold+' threshold')
+    ));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 1 – OVERVIEW
+// ─────────────────────────────────────────────────────────────────────────────
+function OverviewTab({merged,summary,sleepMap,hasBL}){
+  if(!merged?.length) return h(Empty,{msg:'Upload infer_results_ADM.csv to see the overview'});
+  const admId=merged[0]?.admission_id||summary?.admission_id||'—';
+  const blAhi=useMemo(()=>{
+    if(!hasBL)return summary?.ahi_bilstm??null;
+    const nA=merged.filter(r=>r.bilstm_pred===1).length;
+    const dur=summary?.duration_min;if(!dur)return null;
+    return nA/Math.max(dur/60,1e-6);
+  },[merged,hasBL,summary]);
+  const cd=useMemo(()=>merged.map(r=>({
+    idx:r.segment_idx,ecg:r.ecg_hr_bpm,ref:r.ref_hr_bpm,
+    xp:r.apnea_prob,bp:r.bilstm_prob,
+    xa:r.apnea_pred===1?(r.ecg_hr_bpm||60):null,
+    ba:r.bilstm_pred===1?(r.ecg_hr_bpm||60):null,
+    fl:r.hr_gate_pass===0?(r.ecg_hr_bpm||60):null,ts:r.timestamp
+  })),[merged]);
+  const slA=useMemo(()=>{
+    const a=[];let st=null;
+    cd.forEach((d,i)=>{
+      const sl=sleepMap?.get(d.idx)?.is_sleep;
+      if(sl===1&&st==null)st=d.idx;
+      if(sl!==1&&st!=null){a.push([st,cd[i-1]?.idx??d.idx]);st=null;}
+    });
+    if(st!=null)a.push([st,cd[cd.length-1]?.idx]);
+    return a;
+  },[cd,sleepMap]);
+  const evDot=col=>(props)=>{
+    if(props.value==null)return null;
+    return h('circle',{key:String(props.index),cx:props.cx,cy:props.cy,r:5,fill:col,stroke:'#000',strokeWidth:0.5});
+  };
+  return h('div',{className:'fi',style:{height:'100%',overflowY:'auto',padding:'14px 18px'}},
+    h('div',{style:{display:'flex',alignItems:'baseline',gap:12,marginBottom:14}},
+      h('div',{style:{fontSize:18,fontWeight:800,color:'#e2e8f0',fontFamily:'JetBrains Mono'}},admId),
+      summary?.duration_min?h('div',{style:{color:'#334155',fontSize:12}},Math.round(summary.duration_min)+' min recording'):null
+    ),
+    h(Card,{style:{marginBottom:12}},
+      h(Lbl,null,'AHI Results'),
+      h('div',{style:{display:'flex',gap:32,alignItems:'center',flexWrap:'wrap'}},
+        h('div',null,
+          h('div',{style:{color:'#475569',fontSize:10,marginBottom:4}},'XGBoost AHI'),
+          h('div',{style:{display:'flex',alignItems:'baseline',gap:5}},
+            h('span',{style:{fontSize:40,fontWeight:900,color:'#60a5fa',fontFamily:'JetBrains Mono',lineHeight:1}},
+              summary?.ahi_proxy!=null?(+summary.ahi_proxy).toFixed(1):'—'),
+            h('span',{style:{color:'#1e3a5f',fontSize:12}},'/hr')),
+          summary?.severity?h('div',{style:{marginTop:4}},h(SevBadge,{s:summary.severity})):null
+        ),
+        h('div',{style:{width:1,height:60,background:'#1a2d4d'}}),
+        h('div',null,
+          h('div',{style:{color:'#475569',fontSize:10,marginBottom:4}},'BiLSTM AHI'),
+          h('div',{style:{display:'flex',alignItems:'baseline',gap:5}},
+            h('span',{style:{fontSize:40,fontWeight:900,color:'#a78bfa',fontFamily:'JetBrains Mono',lineHeight:1}},
+              blAhi!=null?blAhi.toFixed(1):'—'),
+            h('span',{style:{color:'#1e3a5f',fontSize:12}},'/hr')),
+          blAhi!=null?h('div',{style:{marginTop:4}},h(SevBadge,{s:ahiSev(blAhi)})):null
+        ),
+        !hasBL?h('div',{style:{color:'#1e3a5f',fontSize:11,marginLeft:'auto',padding:'6px 12px',background:'#0d1d30',borderRadius:6,border:'1px solid #1a2d4d'}},'BiLSTM file not loaded'):null
+      )
+    ),
+    h('div',{style:{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}},
+      h(St,{label:'Total Segs',value:summary?.total_segments}),
+      h(St,{label:'Scored',value:summary?.scored_segments}),
+      h(St,{label:'Flagged',value:summary?.flagged_segments,color:'#f97316'}),
+      h(St,{label:'Apnea Segs',value:summary?.n_apnea,color:'#ef4444'}),
+      h(St,{label:'Apnea %',value:summary?.apnea_pct,unit:'%',color:summary?.apnea_pct>30?'#ef4444':summary?.apnea_pct>15?'#f97316':'#e2e8f0'}),
+      h(St,{label:'Duration',value:summary?.duration_min?Math.round(summary.duration_min):null,unit:'min'}),
+      h(St,{label:'Mean HR Δ',value:summary?.mean_hr_diff_bpm,unit:'bpm',mono:true})
+    ),
+    h(Card,null,
+      h(Lbl,null,'Full Recording Timeline (IST) — blue shading=sleep | ● XGB apnea | ● BiLSTM apnea | ● HR flagged'),
+      h('div',{style:{display:'flex',gap:14,marginBottom:6,fontSize:10,flexWrap:'wrap'}},
+        ...[['ECG HR','#60a5fa'],['Ref HR','#34d399'],['XGB Prob','#f97316'],['BiLSTM Prob','#a78bfa'],['XGB Apnea','#ef4444'],['BiLSTM Apnea','#fb923c'],['HR Flagged','#eab308']].map(([l,c])=>
+          h('span',{key:l,style:{display:'flex',alignItems:'center',gap:4,color:'#334155'}},
+            h('span',{style:{width:8,height:8,borderRadius:'50%',background:c}}),l))),
+      h(ResponsiveContainer,{width:'100%',height:300},
+        h(ComposedChart,{data:cd,margin:{top:6,right:60,left:8,bottom:20}},
+          h(CartesianGrid,{strokeDasharray:'3 3',stroke:'#0e1d30'}),
+          ...slA.map(([x1,x2],i)=>h(ReferenceArea,{key:i,x1,x2,fill:'rgba(59,130,246,0.07)',strokeOpacity:0})),
+          h(XAxis,{dataKey:'idx',stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:9},label:{value:'Segment Index',position:'insideBottom',fill:'#1e3a5f',fontSize:9,dy:8}}),
+          h(YAxis,{yAxisId:'hr',stroke:'#1a2d4d',domain:['auto','auto'],tick:{fill:'#1e3a5f',fontSize:9},label:{value:'HR (bpm)',angle:-90,position:'insideLeft',fill:'#1e3a5f',fontSize:9}}),
+          h(YAxis,{yAxisId:'p',orientation:'right',domain:[0,1],stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:9},label:{value:'Prob',angle:90,position:'insideRight',fill:'#1e3a5f',fontSize:9}}),
+          h(Tooltip,{...CS,labelFormatter:v=>{const d=cd.find(r=>r.idx===v);return d?`Seg ${d.idx} · ${toISTShort(d.ts)}`:`Seg ${v}`;},formatter:(val,name)=>[typeof val==='number'?val.toFixed(3):val,name]}),
+          h(Line,{yAxisId:'hr',dataKey:'ecg',name:'ECG HR (bpm)',stroke:'#60a5fa',strokeWidth:1.4,dot:false,connectNulls:true,isAnimationActive:false}),
+          h(Line,{yAxisId:'hr',dataKey:'ref',name:'Ref HR (bpm)',stroke:'#34d399',strokeWidth:1,dot:false,connectNulls:true,strokeDasharray:'4 2',isAnimationActive:false}),
+          h(Line,{yAxisId:'p',dataKey:'xp',name:'XGB Prob',stroke:'#f97316',strokeWidth:1,dot:false,connectNulls:true,isAnimationActive:false}),
+          hasBL?h(Line,{yAxisId:'p',dataKey:'bp',name:'BiLSTM Prob',stroke:'#a78bfa',strokeWidth:1,dot:false,connectNulls:true,isAnimationActive:false}):null,
+          h(Line,{yAxisId:'hr',dataKey:'xa',name:'XGB Apnea',stroke:'none',strokeWidth:0,dot:evDot('#ef4444'),activeDot:false,isAnimationActive:false,connectNulls:false}),
+          h(Line,{yAxisId:'hr',dataKey:'ba',name:'BiLSTM Apnea',stroke:'none',strokeWidth:0,dot:evDot('#fb923c'),activeDot:false,isAnimationActive:false,connectNulls:false}),
+          h(Line,{yAxisId:'hr',dataKey:'fl',name:'HR Flagged',stroke:'none',strokeWidth:0,dot:evDot('#eab308'),activeDot:false,isAnimationActive:false,connectNulls:false}),
+          h(ReferenceLine,{yAxisId:'p',y:0.55,stroke:'#ef444440',strokeDasharray:'4 2',label:{value:'0.55',fill:'#ef4444',fontSize:8}})
+        )
+      )
+    )
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 2 – ECG VIEWER
+// ─────────────────────────────────────────────────────────────────────────────
+function ECGViewerTab({merged,ecgMap,selSeg,onSel}){
+  const cur=merged?.find(r=>r.segment_idx===selSeg)??merged?.[0];
+  const idx=merged?.findIndex(r=>r.segment_idx===selSeg)??0;
+  const total=merged?.length??0;
+  const ecgRaw=useMemo(()=>ecgMap&&cur?ecgMap[String(cur.segment_idx)]:null,[ecgMap,cur?.segment_idx]);
+  const ecg=useMemo(()=>ecgRaw?Array.from(ecgRaw):null,[ecgRaw]);
+  const peaks=useMemo(()=>ecg?detectRPeaks(ecg):[],[ecg]);
+  const edr=useMemo(()=>(ecg&&peaks.length>=2)?computeEDR(ecg,peaks):{t:[],v:[]},[ecg,peaks]);
+  const nav=useCallback(d=>{const ni=Math.max(0,Math.min(total-1,idx+d));onSel(merged[ni].segment_idx);},[idx,total,merged,onSel]);
+  if(!merged?.length)return h(Empty,{msg:'Upload infer_results_ADM.csv to use the ECG viewer'});
+  const isA=cur?.apnea_pred===1;
+  const isF=cur?.hr_gate_pass===0||(cur?.quality_flag&&cur.quality_flag!=='OK');
+  const bc=isA?'#ef4444':isF?'#eab308':'#22c55e';
+  const FEATS=[
+    ['ECG HR',cur?.ecg_hr_bpm,'bpm'],['Ref HR',cur?.ref_hr_bpm,'bpm'],['HR Diff',cur?.hr_diff_bpm,'bpm'],
+    ['RR Mean',cur?.rr_mean,'ms'],['RR Std',cur?.rr_std,'ms'],['RMSSD',cur?.rmssd,'ms'],
+    ['pNN50',cur?.pnn50,'%'],['LF/HF',cur?.lf_hf_ratio,''],['Resp Rate',cur?.resp_rate_bpm,'bpm'],
+    ['Resp Var',cur?.resp_rate_variability,''],['Flatline',cur?.flatline_duration_s,'s'],
+    ['Resp Amp μ',cur?.resp_amplitude_mean,''],['Resp Amp σ',cur?.resp_amplitude_std,''],
+    ['SpO2 Mean',cur?.has_spo2?cur?.spo2_mean:null,'%'],['SpO2 Min',cur?.has_spo2?cur?.spo2_min:null,'%'],
+    ['Has SpO2',cur?.has_spo2?'Yes':'No',''],['Signal Quality',cur?.signal_quality,''],
+    ['Quality Flag',cur?.quality_flag,''],['Rhythm',cur?.dominant_rhythm,''],
+    ['Ectopy',cur?.ectopy_present?'Yes':'No',''],['HR Gate',cur?.hr_gate_pass===1?'Pass':'Fail',''],
+    ['fs',cur?.fs_source_hz,'Hz'],
+  ];
+  return h('div',{className:'fi',style:{display:'flex',height:'100%',overflow:'hidden'}},
+    h('div',{style:{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',padding:'10px 14px'}},
+      h('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:10}},
+        h('button',{onClick:()=>nav(-1),disabled:idx<=0,style:{background:'#0c1526',border:'1px solid #1a2d4d',color:'#475569',borderRadius:6,padding:'5px 12px',fontSize:14}},'◀'),
+        h('div',{style:{flex:1}},
+          h('input',{type:'range',min:0,max:Math.max(0,total-1),value:idx,onChange:e=>onSel(merged[+e.target.value].segment_idx),style:{width:'100%'}})),
+        h('button',{onClick:()=>nav(1),disabled:idx>=total-1,style:{background:'#0c1526',border:'1px solid #1a2d4d',color:'#475569',borderRadius:6,padding:'5px 12px',fontSize:14}},'▶')
+      ),
+      h('div',{style:{background:'#0c1526',border:`2px solid ${bc}`,borderRadius:8,padding:'8px 14px',marginBottom:8,display:'flex',gap:16,alignItems:'center',flexWrap:'wrap'}},
+        h('span',{style:{color:'#1e3a5f',fontSize:10}},'SEG'),
+        h('span',{style:{fontFamily:'JetBrains Mono',fontSize:22,fontWeight:800,color:'#e2e8f0'}},'#'+(cur?.segment_idx??'—')),
+        h('span',{style:{color:'#334155',fontSize:11}},toISTFull(cur?.timestamp)),
+        h('div',{style:{marginLeft:'auto',display:'flex',gap:8}},
+          isA?h('span',{style:{background:'#ef444420',color:'#ef4444',border:'1px solid #ef444430',borderRadius:5,padding:'2px 10px',fontSize:11,fontWeight:700}},'⚠ APNEA'):
+            h('span',{style:{background:'#22c55e12',color:'#22c55e',border:'1px solid #22c55e30',borderRadius:5,padding:'2px 10px',fontSize:11,fontWeight:600}},'✓ NORMAL'),
+          isF?h('span',{style:{background:'#eab30820',color:'#eab308',border:'1px solid #eab30830',borderRadius:5,padding:'2px 10px',fontSize:11}},'⚑ FLAGGED'):null
+        )
+      ),
+      h('div',{style:{background:'#080f1e',border:'1px solid #111f33',borderRadius:8,padding:8,marginBottom:6,position:'relative',height:220,flexShrink:0}},
+        h('div',{style:{position:'absolute',top:6,left:10,color:'#1e3a5f',fontSize:9,zIndex:1,pointerEvents:'none'}},
+          `ECG WAVEFORM · 125 Hz · 30 s · ${peaks.length} R-peaks `,
+          h('span',{style:{color:'#ef4444'}},'● R-peaks')
+        ),
+        ecg?h(ECGCanvas,{ecg,peaks}):h(Empty,{msg:'Upload ADM_segments.csv to view ECG waveform'})
+      ),
+      h('div',{style:{background:'#080f1e',border:'1px solid #111f33',borderRadius:8,padding:8,position:'relative',height:88,flexShrink:0}},
+        h('div',{style:{position:'absolute',top:6,left:10,color:'#1e3a5f',fontSize:9,zIndex:1,pointerEvents:'none'}},'RESPIRATORY PROXY (EDR · QRS envelope · ~4 Hz)'),
+        edr.v.length>0?h(EDRCanvas,{edr}):
+          h('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',height:'100%',color:'#1e3a5f',fontSize:11}},
+            ecg?'Too few R-peaks for EDR':'Load segments.csv')
+      )
+    ),
+    h('div',{style:{width:212,background:'#080f1e',borderLeft:'1px solid #111f33',overflowY:'auto',padding:'12px 10px',flexShrink:0}},
+      h(ProbGauge,{prob:cur?.apnea_prob}),
+      cur?.bilstm_prob!=null?h('div',{style:{textAlign:'center',marginTop:2,marginBottom:8}},
+        h('div',{style:{color:'#1e3a5f',fontSize:9,marginBottom:2}},'BILSTM PROB'),
+        h('div',{style:{fontFamily:'JetBrains Mono',fontSize:16,fontWeight:700,color:cur.bilstm_pred===1?'#a78bfa':'#334155'}},cur.bilstm_prob.toFixed(3))
+      ):null,
+      h('div',{style:{borderTop:'1px solid #111f33',paddingTop:8}},
+        ...FEATS.map(([l,v,u])=>h('div',{key:l,style:{display:'flex',justifyContent:'space-between',alignItems:'baseline',padding:'3px 2px',borderBottom:'1px solid #0a111e'}},
+          h('span',{style:{color:'#1e3a5f',fontSize:9}},l),
+          h('span',{style:{fontFamily:'JetBrains Mono',fontSize:10,color:v==null?'#0f1c2e':'#64748b'}},
+            v==null?'N/A':typeof v==='number'?v.toFixed(2):v,
+            u&&v!=null?h('span',{style:{color:'#1e3a5f',fontSize:8}},' '+u):null
+          )))
+      )
+    )
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 3 – SLEEP FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+function SleepTab({sleepWindows}){
+  if(!sleepWindows?.length)return h(Empty,{msg:'Upload sleep_windows.csv to inspect the sleep filter'});
+  const cd=sleepWindows.map(r=>({
+    idx:r.segment_idx,hr:r.mean_hr,sdnn:r.sdnn,
+    in_w:(r.in_sleep_hours===true||r.in_sleep_hours===1||r.in_sleep_hours==='True'||r.in_sleep_hours==='true')?1:0,
+    score:r.sleep_score,is_s:r.is_sleep,ts:r.timestamp_utc||r.timestamp_ist
+  }));
+  const wins=[];let ws=null;
+  sleepWindows.forEach((r,i)=>{
+    if(r.is_sleep===1&&ws==null)ws={idx:r.segment_idx,ts:r.timestamp_utc};
+    if(r.is_sleep!==1&&ws!=null){
+      const prev=sleepWindows[i-1]||r;
+      wins.push({s:ws.idx,e:prev.segment_idx,ts:ws.ts,te:prev.timestamp_utc,dur:(prev.segment_idx-ws.idx+1)*0.5});
+      ws=null;
+    }
+  });
+  if(ws!=null){const last=sleepWindows[sleepWindows.length-1];wins.push({s:ws.idx,e:last.segment_idx,ts:ws.ts,te:last.timestamp_utc,dur:(last.segment_idx-ws.idx+1)*0.5});}
+  const sAs=wins.map(w=>[w.s,w.e]);
+  const excl=cd.filter(d=>d.in_w===1&&d.is_s===0).map(d=>d.idx);
+  const RA=({areas})=>areas.map(([x1,x2],i)=>h(ReferenceArea,{key:i,x1,x2,fill:'rgba(59,130,246,0.08)',strokeOpacity:0}));
+  const AX=h(XAxis,{dataKey:'idx',stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:8},height:22,label:{value:'Segment Index',position:'insideBottom',fill:'#1e3a5f',fontSize:8,dy:5}});
+  const ps={marginBottom:8,background:'#0c1526',border:'1px solid #1a2d4d',borderRadius:8,padding:'8px 12px 4px'};
+  return h('div',{className:'fi',style:{height:'100%',overflowY:'auto',padding:'12px 18px'}},
+    excl.length>0?h('div',{style:{background:'#eab30812',border:'1px solid #eab30830',borderRadius:6,padding:'6px 12px',fontSize:11,color:'#eab308',marginBottom:10}},
+      `⚑ ${excl.length} segments inside the 9PM–9AM IST window but excluded by HR/SDNN gate`):null,
+    h('div',{style:ps},
+      h('div',{style:{color:'#334155',fontSize:9,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}},'Heart Rate (bpm)'),
+      h(ResponsiveContainer,{width:'100%',height:130},
+        h(ComposedChart,{data:cd,margin:{top:4,right:18,left:40,bottom:18}},
+          h(CartesianGrid,{strokeDasharray:'3 3',stroke:'#0e1d30'}),
+          h(RA,{areas:sAs}),AX,
+          h(YAxis,{stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:8},label:{value:'HR (bpm)',angle:-90,position:'insideLeft',fill:'#1e3a5f',fontSize:8}}),
+          h(Tooltip,{...CS,formatter:v=>[v?.toFixed(1),'HR (bpm)'],labelFormatter:v=>{const d=cd.find(r=>r.idx===v)||{};return `Seg ${d.idx||v} · ${toISTShort(d.ts)}`}}),
+          h(Line,{type:'monotone',dataKey:'hr',stroke:'#f87171',strokeWidth:1.5,dot:false,connectNulls:true,isAnimationActive:false})
+        )
+      )
+    ),
+    h('div',{style:ps},
+      h('div',{style:{color:'#334155',fontSize:9,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}},'SDNN (ms)'),
+      h(ResponsiveContainer,{width:'100%',height:130},
+        h(ComposedChart,{data:cd,margin:{top:4,right:18,left:40,bottom:18}},
+          h(CartesianGrid,{strokeDasharray:'3 3',stroke:'#0e1d30'}),
+          h(RA,{areas:sAs}),AX,
+          h(YAxis,{stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:8},label:{value:'SDNN (ms)',angle:-90,position:'insideLeft',fill:'#1e3a5f',fontSize:8}}),
+          h(Tooltip,{...CS,formatter:v=>[v?.toFixed(1),'SDNN (ms)']}),
+          h(Line,{type:'monotone',dataKey:'sdnn',stroke:'#fb923c',strokeWidth:1.5,dot:false,connectNulls:true,isAnimationActive:false})
+        )
+      )
+    ),
+    h('div',{style:ps},
+      h('div',{style:{color:'#334155',fontSize:9,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}},'In Time Window (9PM–9AM IST)'),
+      h(ResponsiveContainer,{width:'100%',height:75},
+        h(AreaChart,{data:cd,margin:{top:4,right:18,left:40,bottom:18}},
+          h(CartesianGrid,{strokeDasharray:'3 3',stroke:'#0e1d30'}),AX,
+          h(YAxis,{domain:[0,1],ticks:[0,1],stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:8}}),
+          h(Tooltip,{...CS,formatter:v=>[v?'In window':'Outside','']}),
+          h(Area,{type:'stepAfter',dataKey:'in_w',fill:'rgba(34,197,94,0.18)',stroke:'#22c55e',strokeWidth:1,isAnimationActive:false})
+        )
+      )
+    ),
+    h('div',{style:ps},
+      h('div',{style:{color:'#334155',fontSize:9,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}},'Sleep Score (threshold = 0.50) · shaded = is_sleep=1'),
+      h(ResponsiveContainer,{width:'100%',height:130},
+        h(ComposedChart,{data:cd,margin:{top:4,right:18,left:40,bottom:18}},
+          h(CartesianGrid,{strokeDasharray:'3 3',stroke:'#0e1d30'}),
+          h(RA,{areas:sAs}),AX,
+          h(YAxis,{domain:[0,1.1],stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:8},label:{value:'Score',angle:-90,position:'insideLeft',fill:'#1e3a5f',fontSize:8}}),
+          h(Tooltip,{...CS}),
+          h(Area,{type:'stepAfter',dataKey:'is_s',fill:'rgba(96,165,250,0.12)',stroke:'none',isAnimationActive:false}),
+          h(Line,{type:'monotone',dataKey:'score',name:'Sleep Score',stroke:'#60a5fa',strokeWidth:1.5,dot:false,connectNulls:true,isAnimationActive:false}),
+          h(ReferenceLine,{y:0.5,stroke:'#eab308',strokeDasharray:'4 2',label:{value:'0.50',fill:'#eab308',fontSize:8,position:'insideTopLeft'}})
+        )
+      )
+    ),
+    h(Card,null,
+      h(Lbl,null,`Sleep Windows Found: ${wins.length}`),
+      wins.length===0?h('div',{style:{color:'#1e3a5f',fontSize:12}},'No sleep windows detected'):null,
+      ...wins.map((w,i)=>h('div',{key:i,style:{display:'flex',gap:16,padding:'6px 0',borderBottom:'1px solid #0d1624',alignItems:'center',fontSize:11,flexWrap:'wrap'}},
+        h('span',{style:{color:'#60a5fa',fontFamily:'JetBrains Mono',fontWeight:700,fontSize:12}},'#'+(i+1)),
+        h('span',{style:{color:'#1e3a5f'}},'Segs '+w.s+'–'+w.e),
+        h('span',{style:{color:'#334155'}},toISTShort(w.ts)),
+        h('span',{style:{color:'#0f1c2e'}},'→'),
+        h('span',{style:{color:'#334155'}},toISTShort(w.te)),
+        h('span',{style:{color:'#22c55e',marginLeft:'auto',fontFamily:'JetBrains Mono',fontWeight:700}},w.dur.toFixed(0)+' min')
+      ))
+    )
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 4 – MODEL COMPARISON
+// ─────────────────────────────────────────────────────────────────────────────
+function ModelsTab({merged,hasBL,onSel,onTab}){
+  if(!merged?.length)return h(Empty,{msg:'Upload infer_results_ADM.csv to compare models'});
+  const cd=merged.map(r=>({idx:r.segment_idx,xp:r.apnea_prob,bp:r.bilstm_prob}));
+  const stats=useMemo(()=>{
+    let agree=0,xonly=0,bonly=0,both0=0,both1=0;const disagree=[];
+    merged.forEach(r=>{
+      const x=r.apnea_pred===1,b=r.bilstm_pred===1;
+      if(r.bilstm_pred==null){agree++;return;}
+      if(x&&b)both1++;else if(!x&&!b)both0++;else if(x){xonly++;disagree.push(r);}else{bonly++;disagree.push(r);}
+      if(x===b)agree++;
+    });
+    return{agree,xonly,bonly,both0,both1,disagree,total:merged.length};
+  },[merged]);
+  const ap=stats.total?((stats.agree/stats.total)*100).toFixed(1):0;
+  const cellC=r=>{
+    const x=r.apnea_pred===1,b=r.bilstm_pred===1;
+    if(r.hr_gate_pass===0)return'#0f1c2e';
+    if(r.bilstm_pred==null)return x?'#ef4444':'#22c55e15';
+    if(x&&b)return'#ef4444';if(!x&&!b)return'#22c55e15';
+    return x?'#3b82f6':'#f97316';
+  };
+  return h('div',{className:'fi',style:{height:'100%',overflowY:'auto',padding:'12px 18px'}},
+    !hasBL?h('div',{style:{background:'#eab30810',border:'1px solid #eab30830',borderRadius:6,padding:'6px 12px',fontSize:11,color:'#eab308',marginBottom:10}},'⚠ BiLSTM file not loaded — upload bilstm_infer_results.csv for full comparison'):null,
+    h('div',{style:{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}},
+      h(St,{label:'Agreement',value:ap+'%',color:'#22c55e'}),
+      h(St,{label:'Both Apnea',value:stats.both1,color:'#ef4444'}),
+      h(St,{label:'XGB Only',value:stats.xonly,color:'#3b82f6'}),
+      h(St,{label:'BiLSTM Only',value:stats.bonly,color:'#f97316'}),
+      h(St,{label:'Both Normal',value:stats.both0,color:'#334155'})
+    ),
+    h(Card,{style:{marginBottom:12}},
+      h(Lbl,null,'Model Probabilities per Segment'),
+      h(ResponsiveContainer,{width:'100%',height:220},
+        h(LineChart,{data:cd,margin:{top:5,right:18,left:40,bottom:22}},
+          h(CartesianGrid,{strokeDasharray:'3 3',stroke:'#0e1d30'}),
+          h(XAxis,{dataKey:'idx',stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:9},label:{value:'Segment Index',position:'insideBottom',fill:'#1e3a5f',fontSize:9,dy:8}}),
+          h(YAxis,{domain:[0,1],stroke:'#1a2d4d',tick:{fill:'#1e3a5f',fontSize:9},label:{value:'Apnea Prob',angle:-90,position:'insideLeft',fill:'#1e3a5f',fontSize:9,dx:8}}),
+          h(Tooltip,{...CS,formatter:(v,n)=>[v?.toFixed(3),n]}),
+          h(ReferenceLine,{y:0.55,stroke:'#eab30860',strokeDasharray:'4 2',label:{value:'0.55',fill:'#eab308',fontSize:8}}),
+          h(Line,{type:'monotone',dataKey:'xp',name:'XGBoost',stroke:'#60a5fa',strokeWidth:1.5,dot:false,connectNulls:true,isAnimationActive:false}),
+          hasBL?h(Line,{type:'monotone',dataKey:'bp',name:'BiLSTM',stroke:'#a78bfa',strokeWidth:1.5,dot:false,connectNulls:true,isAnimationActive:false}):null,
+          h(Legend,{wrapperStyle:{fontSize:10,color:'#334155'}})
+        )
+      )
+    ),
+    h(Card,{style:{marginBottom:12}},
+      h('div',{style:{display:'flex',gap:16,marginBottom:8,alignItems:'center',flexWrap:'wrap'}},
+        h(Lbl,null,'Per-Segment Agreement Grid (click → ECG viewer)'),
+        h('div',{style:{display:'flex',gap:8,fontSize:9,flexWrap:'wrap'}},
+          ...[['Both Apnea','#ef4444'],['Both Normal','#22c55e30'],['XGB Only','#3b82f6'],['BiLSTM Only','#f97316'],['Flagged','#0f1c2e']].map(([l,c])=>
+            h('span',{key:l,style:{display:'flex',alignItems:'center',gap:3,color:'#1e3a5f'}},
+              h('span',{style:{width:9,height:9,background:c,borderRadius:2,border:'1px solid #1a2d4d20'}}),l))
+        )
+      ),
+      h('div',{style:{display:'flex',flexWrap:'wrap',gap:2,maxHeight:180,overflowY:'auto'}},
+        ...merged.map(r=>h('div',{key:r.segment_idx,
+          title:`Seg ${r.segment_idx}: XGB=${r.apnea_pred} BiLSTM=${r.bilstm_pred??'?'} · ${toISTShort(r.timestamp)}`,
+          onClick:()=>{onSel(r.segment_idx);onTab(1);},
+          style:{width:11,height:11,borderRadius:2,background:cellC(r),cursor:'pointer',border:'1px solid #00000020',transition:'transform 0.1s'},
+          onMouseEnter:e=>e.currentTarget.style.transform='scale(1.9)',
+          onMouseLeave:e=>e.currentTarget.style.transform='scale(1)'}))
+      )
+    ),
+    h(Card,null,
+      h(Lbl,null,`Disagreements — ${stats.disagree.length} segments (click row → ECG viewer)`),
+      h('div',{style:{overflowX:'auto',maxHeight:280,overflowY:'auto'}},
+        h('table',{style:{width:'100%',fontSize:11}},
+          h('thead',{style:{position:'sticky',top:0,background:'#0a111e'}},
+            h('tr',null,...['Seg','Time (IST)','XGB Prob','BiLSTM Prob','ECG HR','Quality Flag'].map(hd=>
+              h('th',{key:hd,style:{padding:'5px 8px',color:'#1e3a5f',fontWeight:600,textAlign:'left',borderBottom:'1px solid #1a2d4d',whiteSpace:'nowrap'}},hd)))),
+          h('tbody',null,
+            ...stats.disagree.map(r=>h('tr',{key:r.segment_idx,
+              onClick:()=>{onSel(r.segment_idx);onTab(1);},
+              style:{cursor:'pointer',borderBottom:'1px solid #0a111e'},
+              onMouseEnter:e=>e.currentTarget.style.background='#0f1c2e',
+              onMouseLeave:e=>e.currentTarget.style.background='transparent'},
+              h('td',{style:{padding:'4px 8px',fontFamily:'JetBrains Mono',color:'#60a5fa'}},'#'+r.segment_idx),
+              h('td',{style:{padding:'4px 8px',color:'#1e3a5f',fontSize:10,whiteSpace:'nowrap'}},toISTShort(r.timestamp)),
+              h('td',{style:{padding:'4px 8px',fontFamily:'JetBrains Mono',color:r.apnea_pred===1?'#ef4444':'#22c55e'}},r.apnea_prob?.toFixed(3)),
+              h('td',{style:{padding:'4px 8px',fontFamily:'JetBrains Mono',color:r.bilstm_pred===1?'#a78bfa':'#334155'}},r.bilstm_prob?.toFixed(3)??'—'),
+              h('td',{style:{padding:'4px 8px',fontFamily:'JetBrains Mono',color:'#64748b'}},r.ecg_hr_bpm?.toFixed(1)),
+              h('td',{style:{padding:'4px 8px',color:r.quality_flag!=='OK'?'#eab308':'#1e3a5f',fontSize:10}},r.quality_flag)
+            )),
+            stats.disagree.length===0?h('tr',null,h('td',{colSpan:6,style:{textAlign:'center',color:'#1e3a5f',padding:24,fontSize:12}},'✓ Models fully agree')):null
+          )
+        )
+      )
+    )
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 5 – SEGMENT TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+const PS=50;
+function SegTable({merged,sleepMap,onSel,onTab}){
+  const [page,setPage]=useState(0);
+  const [filter,setFilter]=useState('all');
+  const [sortK,setSortK]=useState('segment_idx');
+  const [sortD,setSortD]=useState(1);
+  const [search,setSearch]=useState('');
+  const filtered=useMemo(()=>{
+    if(!merged?.length)return[];
+    let r=[...merged];
+    if(filter==='apnea')r=r.filter(x=>x.apnea_pred===1);
+    if(filter==='flagged')r=r.filter(x=>x.hr_gate_pass===0||(x.quality_flag&&x.quality_flag!=='OK'));
+    if(filter==='sleep')r=r.filter(x=>sleepMap?.get(x.segment_idx)?.is_sleep===1);
+    if(filter==='disagree')r=r.filter(x=>x.bilstm_pred!=null&&x.apnea_pred!==x.bilstm_pred);
+    if(search.trim()){const s=search.toLowerCase();r=r.filter(x=>String(x.segment_idx).includes(s)||String(x.quality_flag||'').toLowerCase().includes(s)||String(x.dominant_rhythm||'').toLowerCase().includes(s));}
+    r.sort((a,b)=>{const av=a[sortK]??-Infinity,bv=b[sortK]??-Infinity;return(av<bv?-1:av>bv?1:0)*sortD;});
+    return r;
+  },[merged,filter,sortK,sortD,search,sleepMap]);
+  const totalP=Math.ceil(filtered.length/PS);
+  const pageR=filtered.slice(page*PS,(page+1)*PS);
+  const sort=k=>{if(sortK===k)setSortD(d=>-d);else{setSortK(k);setSortD(1);}setPage(0);};
+  const COLS=[
+    {k:'segment_idx',h:'Seg #',w:60,render:v=>h('span',{style:{fontFamily:'JetBrains Mono',color:'#60a5fa',fontSize:11}},v)},
+    {k:'timestamp',h:'Time (IST)',w:145,render:v=>h('span',{style:{color:'#1e3a5f',fontSize:9,whiteSpace:'nowrap'}},toISTShort(v))},
+    {k:'ecg_hr_bpm',h:'ECG HR',u:'bpm',w:70},{k:'ref_hr_bpm',h:'Ref HR',u:'bpm',w:70},
+    {k:'hr_diff_bpm',h:'HR Δ',u:'bpm',w:65},
+    {k:'quality_flag',h:'QF',w:110,render:v=>h('span',{style:{color:v!=='OK'?'#eab308':'#22c55e',fontSize:10}},v)},
+    {k:'resp_rate_bpm',h:'Resp Rate',u:'bpm',w:80},
+    {k:'apnea_prob',h:'XGB Prob',w:80,render:(v,r)=>h('span',{style:{fontFamily:'JetBrains Mono',color:r.apnea_pred===1?'#ef4444':'#22c55e',fontSize:11}},v?.toFixed(3)??'—')},
+    {k:'bilstm_prob',h:'BiLSTM Prob',w:90,render:(v,r)=>h('span',{style:{fontFamily:'JetBrains Mono',color:r.bilstm_pred===1?'#a78bfa':'#334155',fontSize:11}},v?.toFixed(3)??'—')},
+    {k:'apnea_pred',h:'Label',w:75,render:v=>h('span',{style:{color:v===1?'#ef4444':'#22c55e',fontSize:10,fontWeight:700}},v===1?'APNEA':'NORMAL')},
+    {k:'spo2_mean',h:'SpO2 μ',u:'%',w:65},
+    {k:'has_spo2',h:'SpO2?',w:55,render:v=>h('span',{style:{color:v?'#22c55e':'#1e3a5f',fontSize:10}},v?'Yes':'No')},
+    {k:'signal_quality',h:'Sig. Quality',w:90,render:v=>h('span',{style:{color:v==='poor'?'#f87171':'#334155',fontSize:10}},v)},
+  ];
+  const rowBg=r=>r.apnea_pred===1?'rgba(239,68,68,0.07)':r.hr_gate_pass===0?'rgba(234,179,8,0.06)':'transparent';
+  if(!merged?.length)return h(Empty,{msg:'Upload infer_results_ADM.csv to view the segment table'});
+  const counts={
+    apnea:merged.filter(r=>r.apnea_pred===1).length,
+    flagged:merged.filter(r=>r.hr_gate_pass===0||(r.quality_flag&&r.quality_flag!=='OK')).length,
+    sleep:merged.filter(r=>sleepMap?.get(r.segment_idx)?.is_sleep===1).length,
+    disagree:merged.filter(r=>r.bilstm_pred!=null&&r.apnea_pred!==r.bilstm_pred).length,
+  };
+  return h('div',{style:{display:'flex',flexDirection:'column',height:'100%',overflow:'hidden'}},
+    h('div',{style:{padding:'8px 16px',background:'#08111f',borderBottom:'1px solid #1a2d4d',display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',flexShrink:0}},
+      h('input',{type:'text',placeholder:'Search seg # / flag / rhythm…',value:search,
+        onChange:e=>{setSearch(e.target.value);setPage(0);},
+        style:{background:'#0c1526',border:'1px solid #1a2d4d',borderRadius:6,color:'#e2e8f0',padding:'5px 10px',fontSize:11,width:220}}),
+      ...[['all',`All (${merged.length})`],['apnea',`Apnea (${counts.apnea})`],['flagged',`Flagged (${counts.flagged})`],['sleep',`Sleep (${counts.sleep})`],['disagree',`Disagree (${counts.disagree})`]].map(([k,lbl])=>
+        h('button',{key:k,onClick:()=>{setFilter(k);setPage(0);},
+          style:{background:filter===k?'#1e3a5f':'#0c1526',border:`1px solid ${filter===k?'#3b82f6':'#1a2d4d'}`,color:filter===k?'#60a5fa':'#334155',borderRadius:6,padding:'5px 11px',fontSize:10,whiteSpace:'nowrap'}},lbl)),
+      h('span',{style:{marginLeft:'auto',color:'#1e3a5f',fontSize:10}},`${filtered.length} rows · p${page+1}/${Math.max(1,totalP)}`)
+    ),
+    h('div',{style:{flex:1,overflowX:'auto',overflowY:'auto'}},
+      h('table',{style:{width:'100%',fontSize:11}},
+        h('thead',{style:{position:'sticky',top:0,background:'#08111f',zIndex:2}},
+          h('tr',{style:{borderBottom:'1px solid #1a2d4d'}},
+            ...COLS.map(c=>h('th',{key:c.k,onClick:()=>sort(c.k),
+              style:{padding:'6px 8px',color:sortK===c.k?'#60a5fa':'#1e3a5f',fontWeight:700,textAlign:'left',cursor:'pointer',whiteSpace:'nowrap',minWidth:c.w,userSelect:'none'}},
+              c.h+(sortK===c.k?(sortD>0?' ↑':' ↓'):'')))),
+        ),
+        h('tbody',null,
+          ...pageR.map(r=>h('tr',{key:r.segment_idx,onClick:()=>{onSel(r.segment_idx);onTab(1);},
+            style:{borderBottom:'1px solid #0a111e',cursor:'pointer',background:rowBg(r),transition:'background 0.1s'},
+            onMouseEnter:e=>e.currentTarget.style.background='#0f1c2e',
+            onMouseLeave:e=>e.currentTarget.style.background=rowBg(r)},
+            ...COLS.map(c=>{const val=r[c.k];return h('td',{key:c.k,style:{padding:'4px 8px',whiteSpace:'nowrap'}},
+              c.render?c.render(val,r):
+                h('span',{style:{fontFamily:'JetBrains Mono',color:'#64748b',fontSize:11}},
+                  val==null?'—':typeof val==='number'?val.toFixed(2):val,
+                  c.u&&val!=null?h('span',{style:{color:'#1e3a5f',fontSize:9}},' '+c.u):null
+                ));}))
+          ),
+          pageR.length===0?h('tr',null,h('td',{colSpan:COLS.length,style:{textAlign:'center',color:'#1e3a5f',padding:30,fontSize:12}},'No matching segments')):null
+        )
+      )
+    ),
+    h('div',{style:{padding:'6px 16px',background:'#08111f',borderTop:'1px solid #1a2d4d',display:'flex',gap:4,alignItems:'center',justifyContent:'center',flexShrink:0}},
+      ...[['«',()=>setPage(0)],['‹',()=>setPage(p=>Math.max(0,p-1))],['›',()=>setPage(p=>Math.min(totalP-1,p+1))],['»',()=>setPage(totalP-1)]].map(([lbl,fn],i)=>
+        h('button',{key:i,onClick:fn,style:{background:'#0c1526',border:'1px solid #1a2d4d',color:'#334155',borderRadius:4,padding:'4px 8px',fontSize:11}},lbl)),
+      ...Array.from({length:Math.min(7,totalP)},(_,i)=>{
+        const p=Math.max(0,Math.min(totalP-7,page-3))+i;
+        return h('button',{key:p,onClick:()=>setPage(p),style:{background:p===page?'#1e3a5f':'#0c1526',border:`1px solid ${p===page?'#3b82f6':'#1a2d4d'}`,color:p===page?'#60a5fa':'#334155',borderRadius:4,padding:'4px 8px',fontSize:11}},p+1);
+      })
+    )
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN APP
+// ─────────────────────────────────────────────────────────────────────────────
+function App(){
+  const [tab,setTab]=useState(0);
+  const [selSeg,setSelSeg]=useState(0);
+  const [raw,setRaw]=useState({segments:null,ecgMap:null,inferXgb:null,inferBL:null,sleepWindows:null,summary:null});
+  
+  // Shared state for upload/fetch progress
+  const [st,setSt]=useState({});
+  const [pg,setPg]=useState({});
+
+  const onLoad=useCallback((key,result)=>{
+    setRaw(prev=>{
+      const next={...prev};
+      if(key==='segments'){next.segments=result.rows;next.ecgMap=result.ecgMap;}
+      else if(key==='inferXgb')next.inferXgb=result.rows;
+      else if(key==='inferBL')next.inferBL=result.rows;
+      else if(key==='sleep')next.sleepWindows=result.rows;
+      else if(key==='summary')next.summary=result.rows?.[0];
+      return next;
+    });
+  },[]);
+
+  const handle=useCallback(async(file,key)=>{
+    setSt(s=>({...s,[key]:'loading'}));
+    try{
+      const r=await parseCSV(file,key,n=>setPg(p=>({...p,[key]:n})));
+      onLoad(key,r);setSt(s=>({...s,[key]:'ok'}));
+    }catch(e){console.error(e);setSt(s=>({...s,[key]:'err'}));}
+  },[onLoad]);
+
+  // Auto-fetch data from backend on load
+  useEffect(()=>{
+    FDEFS.forEach(async ({key, file}) => {
+      try {
+        setSt(s=>({...s,[key]:'loading'}));
+        const res = await fetch('./' + file);
+        if (!res.ok) throw new Error('Not found');
+        const blob = await res.blob();
+        blob.name = file;
+        handle(blob, key);
+      } catch (e) {
+        setSt(s=>({...s,[key]:'err'}));
+      }
+    });
+  }, []);
+
+  const blMap=useMemo(()=>{
+    if(!raw.inferBL)return new Map();
+    return new Map(raw.inferBL.map(r=>[+r.segment_idx,r]));
+  },[raw.inferBL]);
+  const sleepMap=useMemo(()=>{
+    if(!raw.sleepWindows)return new Map();
+    return new Map(raw.sleepWindows.map(r=>[+r.segment_idx,r]));
+  },[raw.sleepWindows]);
+  const merged=useMemo(()=>{
+    if(!raw.inferXgb)return[];
+    return raw.inferXgb.map(r=>({...r,
+      bilstm_prob:blMap.get(+r.segment_idx)?.apnea_prob??null,
+      bilstm_pred:blMap.get(+r.segment_idx)?.apnea_pred??null}));
+  },[raw.inferXgb,blMap]);
+  const hasBL=!!raw.inferBL;
+  const admId=raw.summary?.admission_id||merged[0]?.admission_id;
+  return h('div',{style:{display:'flex',flexDirection:'column',height:'100vh',overflow:'hidden',background:'#060b16'}},
+    // Header
+    h('div',{style:{background:'linear-gradient(90deg,#060b16 0%,#0a1428 50%,#060b16 100%)',borderBottom:'1px solid #1a2d4d',padding:'10px 20px',display:'flex',alignItems:'center',gap:14,flexShrink:0}},
+      h('div',{style:{display:'flex',alignItems:'center',gap:10}},
+        h('div',{style:{width:32,height:32,borderRadius:8,background:'linear-gradient(135deg,#1e3a5f,#0e4f8a)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:18}},'💓'),
+        h('div',null,
+          h('div',{style:{color:'#60a5fa',fontSize:13,fontWeight:800,letterSpacing:'0.04em',lineHeight:1}},'ECG APNEA VERIFICATION DASHBOARD'),
+          h('div',{style:{color:'#1e3a5f',fontSize:9,marginTop:2}},'All times in IST (UTC+5:30) · Research prototype — not for clinical use')
+        )
+      ),
+      admId?h('div',{style:{marginLeft:'auto',background:'#0f1e35',border:'1px solid #1a2d4d',borderRadius:6,padding:'4px 14px',fontFamily:'JetBrains Mono',fontSize:12,color:'#60a5fa',fontWeight:700}},admId):null
+    ),
+    h(UploadZone,{onLoad, st, setSt, pg, setPg, handle}),
+    h(TabBar,{active:tab,onSelect:setTab}),
+    h('div',{style:{flex:1,overflow:'hidden'}},
+      tab===0?h(OverviewTab,{merged,summary:raw.summary,sleepMap,hasBL}):null,
+      tab===1?h(ECGViewerTab,{merged,ecgMap:raw.ecgMap,selSeg,onSel:setSelSeg}):null,
+      tab===2?h(SleepTab,{sleepWindows:raw.sleepWindows}):null,
+      tab===3?h(ModelsTab,{merged,hasBL,onSel:setSelSeg,onTab:setTab}):null,
+      tab===4?h(SegTable,{merged,sleepMap,onSel:setSelSeg,onTab:setTab}):null
+    )
+  );
+}
+
+render(h(App,null), document.getElementById('root'));
+</script>
+</body>
+</html>

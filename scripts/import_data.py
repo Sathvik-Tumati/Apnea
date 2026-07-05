@@ -21,6 +21,8 @@ from typing import Dict, List
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from import_frontierx import import_frontierx, is_frontierx_file
+from import_frontierx_spo2 import import_frontierx_spo2
 
 ###########################################################
 # CONFIG
@@ -568,6 +570,9 @@ def import_admission(admission, files):
 ###########################################################
 
 def main():
+
+    import_frontierx(UPLOAD_DIR)
+    import_frontierx_spo2(UPLOAD_DIR)
 
     print("=" * 70)
     print("SUPABASE MEDICAL DATA IMPORTER")

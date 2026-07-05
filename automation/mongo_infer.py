@@ -122,6 +122,7 @@ SPO2_FEATURE_COLS = [
     "spo2_mean", "spo2_min", "spo2_delta_index",
     "odi", "t90", "spo2_approx_entropy",
 ]
+SPO2_RAW_COLS = [f"spo2Data[{i}]" for i in range(SAMPLES_SPO2_SEG)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -880,18 +881,23 @@ def build_segment_csv(
         if spo2_start is not None and has_spo2_global:
             spo2_end = spo2_start + SAMPLES_SPO2_SEG
             if spo2_end <= len(spo2_signal):
+                spo2_seg = spo2_signal[spo2_start:spo2_end]
                 spo2_feats = _compute_spo2_features(
-                    spo2_signal[spo2_start:spo2_end],
+                    spo2_seg,
                     baseline_override=global_spo2_baseline)
             elif spo2_start < len(spo2_signal):
                 # Tail: partial segment — use whatever remains if ≥ 10 samples
+                spo2_seg = spo2_signal[spo2_start:]
                 spo2_feats = _compute_spo2_features(
-                    spo2_signal[spo2_start:],
+                    spo2_seg,
                     baseline_override=global_spo2_baseline)
+                spo2_seg = np.pad(spo2_seg, (0, SAMPLES_SPO2_SEG - len(spo2_seg)), constant_values=np.nan)
             else:
                 spo2_feats = dict(_SPO2_DEFAULTS)
+                spo2_seg = np.full(SAMPLES_SPO2_SEG, np.nan)
         else:
             spo2_feats = dict(_SPO2_DEFAULTS)
+            spo2_seg = np.full(SAMPLES_SPO2_SEG, np.nan)
 
         if spo2_feats["has_spo2"] == 1:
             n_spo2_segs += 1
@@ -911,6 +917,7 @@ def build_segment_csv(
             row[f"analysis.segments[{i}].rhythm_label"]      = ""
             row[f"analysis.segments[{i}].ectopy_label"]      = ""
         row.update(spo2_feats)
+        row.update(dict(zip(SPO2_RAW_COLS, np.round(spo2_seg.astype(float), 2).tolist())))
         row.update(dict(zip(ECG_COLS, np.round(seg.astype(float), 6).tolist())))
         rows.append(row)
 
@@ -930,6 +937,7 @@ def build_segment_csv(
          "analysis.background_rhythm"]
         + HR_COLS + RHYTHM_COLS + ECTOPY_COLS
         + SPO2_FEATURE_COLS + ["has_spo2"]
+        + SPO2_RAW_COLS
         + ECG_COLS
     )
     for c in fixed_cols:
