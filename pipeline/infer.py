@@ -34,10 +34,28 @@ when they are parseable, falling back to n_segments × 30s only when
 timestamps are missing or malformed.  This avoids inflating AHI when
 there are packet gaps in the recording.
 
+Feature representation (flatten vs aggregate)
+-----------------------------------------------
+pipeline.py's models flatten each (T=10, F=30) feature sequence into 300
+raw positional columns. pipeline/train_improved.py can ALSO train models
+on an "aggregate" representation (per-feature mean/std/min/max/last/delta
+across the window, ~180 columns) which has tested better in controlled
+comparisons. A model trained on one representation is meaningless if fed
+the other — same weights, different-meaning input columns.
+
+To avoid that failure mode, train_improved.py writes a companion
+`<model_stem>_meta.json` file recording which representation the model
+expects. This script looks for that file next to --model and builds
+features accordingly automatically. If no metadata file is found (e.g.
+a plain pipeline.py-trained model), it assumes "flatten" — pipeline.py's
+only representation — which preserves backward compatibility.
+
 Workflow
 --------
 1. Train on MIMIC and save model + scaler:
        python pipeline/pipeline.py --fresh --save-model
+   ...or, for the tuned/aggregate-features path:
+       python pipeline/train_improved.py --feature-mode aggregate --save-model
 
 2. Run inference:
        python infer.py --csv /path/to/ecg_analysis.arrhythmia_results.csv
@@ -53,13 +71,17 @@ Usage
 python infer.py --csv /path/to/file.csv
 python infer.py --csv /path/to/file.csv --force-hz 250
 python infer.py --csv /path/to/file.csv --admission ADM914251465 --threshold 0.40
+python infer.py --csv /path/to/file.csv --feature-mode aggregate   # override auto-detect
 """
 
 import argparse
+import json
 import logging
 import os
 import pickle
+import time
 import warnings
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -138,6 +160,80 @@ APNEA_FEATURE_COLS = [
     "resp_spo2_lag_s", "ptt_ms", "ecg_resp_coherence",
     "has_spo2", "has_abp", "has_resp_gt",
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MODEL FEATURE-REPRESENTATION METADATA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_FEATURE_MODE = "flatten"  # pipeline.py's only representation
+
+
+def _load_model_feature_mode(model_path: str) -> str:
+    """
+    Look for a `<model_stem>_meta.json` next to `model_path` (written by
+    pipeline/train_improved.py) recording which feature representation
+    this model expects. Falls back to "flatten" — the only representation
+    plain pipeline.py-trained models use — when no metadata file exists,
+    so older models keep working unchanged.
+    """
+    p = Path(model_path)
+    meta_path = p.parent / (p.stem + "_meta.json")
+    if not meta_path.exists():
+        logger.info(
+            "[MODEL] No %s found — assuming feature_mode='%s' "
+            "(pipeline.py's default representation).",
+            meta_path.name, DEFAULT_FEATURE_MODE,
+        )
+        return DEFAULT_FEATURE_MODE
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        mode = meta.get("feature_mode", DEFAULT_FEATURE_MODE)
+        logger.info("[MODEL] Loaded %s → feature_mode='%s'", meta_path.name, mode)
+        return mode
+    except Exception as exc:
+        logger.warning(
+            "[MODEL] Failed to read %s (%s) — assuming feature_mode='%s'",
+            meta_path.name, exc, DEFAULT_FEATURE_MODE,
+        )
+        return DEFAULT_FEATURE_MODE
+
+
+def _aggregate_sequence_features(X_seq: np.ndarray) -> np.ndarray:
+    """
+    Must exactly mirror pipeline/train_improved.py's
+    _aggregate_sequence_features — same stats, same concatenation order —
+    or a model trained on one and served from the other will silently
+    produce garbage predictions despite matching array shapes.
+    """
+    mean_  = X_seq.mean(axis=1)
+    std_   = X_seq.std(axis=1)
+    min_   = X_seq.min(axis=1)
+    max_   = X_seq.max(axis=1)
+    last_  = X_seq[:, -1, :]
+    delta_ = X_seq[:, -1, :] - X_seq[:, 0, :]
+    return np.concatenate([mean_, std_, min_, max_, last_, delta_], axis=1)
+
+
+def _flatten_sequence_features(X_seq: np.ndarray) -> np.ndarray:
+    return X_seq.reshape(len(X_seq), -1)
+
+
+def _build_model_features(X_seq: np.ndarray, feature_mode: str) -> np.ndarray:
+    if feature_mode == "aggregate":
+        return _aggregate_sequence_features(X_seq)
+    elif feature_mode == "flatten":
+        return _flatten_sequence_features(X_seq)
+    elif feature_mode == "both":
+        return np.concatenate(
+            [_aggregate_sequence_features(X_seq), _flatten_sequence_features(X_seq)], axis=1
+        )
+    else:
+        logger.warning(
+            "[MODEL] Unknown feature_mode '%s' — falling back to flatten.", feature_mode
+        )
+        return _flatten_sequence_features(X_seq)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -550,24 +646,28 @@ def _run_one_admission(
     threshold: float,
     out_dir:   str,
     hz:        int,
+    model_path: str,
+    feature_mode: str = DEFAULT_FEATURE_MODE,
 ) -> Dict:
     n = len(adm_df)
     ds_note = "" if hz == 125 else "  (250→125 Hz dual-path downsample)"
     logger.info("[%s] %d segments  (%.1f min)%s",
                 adm_id, n, n * SEGMENT_LEN_S / 60.0, ds_note)
 
-    # Log SpO2 coverage
+    # Track SpO2 coverage
     if "has_spo2" in adm_df.columns:
         n_spo2 = int((adm_df["has_spo2"].astype(float) == 1).sum())
         logger.info("[%s] SpO2 available in %d / %d segments (%.0f%%)",
                     adm_id, n_spo2, n, 100.0 * n_spo2 / max(n, 1))
     else:
+        n_spo2 = 0
         logger.info("[%s] No has_spo2 column — ECG-only mode", adm_id)
 
     baseline   = _compute_baseline(adm_df, hz)
     rows_out   = []
     n_flag_hr  = 0
     n_flag_q   = 0
+    inference_start = time.time() 
 
     for seg_i, (_, row) in enumerate(adm_df.iterrows()):
         ecg = _get_ecg(row, hz)
@@ -663,12 +763,19 @@ def _run_one_admission(
     pred_col = np.full(n, np.nan)
 
     if len(X_seq) > 0:
-        logger.info("[%s] Running model on %d sequences ...", adm_id, len(X_seq))
+        logger.info("[%s] Running model on %d sequences (feature_mode=%s) ...",
+                    adm_id, len(X_seq), feature_mode)
         
         if hasattr(model, "predict_proba"):
-            X_seq_flat = X_seq.reshape(len(X_seq), -1)
-            y_prob = model.predict_proba(X_seq_flat)[:, 1]
-            logger.info("[%s] Using predict_proba for tree model", adm_id)
+            # Build features the way THIS model was actually trained on —
+            # previously this always flattened, which silently breaks (shape
+            # mismatch, or worse a shape coincidence producing garbage
+            # predictions) for models trained with train_improved.py's
+            # --feature-mode aggregate. See _load_model_feature_mode().
+            X_seq_model = _build_model_features(X_seq, feature_mode)
+            y_prob = model.predict_proba(X_seq_model)[:, 1]
+            logger.info("[%s] Using predict_proba for tree model (features=%d cols)",
+                        adm_id, X_seq_model.shape[1])
         else:
             y_prob = model.predict(X_seq, verbose=0, batch_size=64).flatten()
 
@@ -839,6 +946,15 @@ def _run_one_admission(
     else:
         logger.info("[%s] No apnea detected above threshold %.2f", adm_id, threshold)
 
+    # ── Calculate inference time ──────────────────────────────────────────────
+    inference_time_ms = round((time.time() - inference_start) * 1000, 1)
+    
+    # ── Get model version from path ──────────────────────────────────────────
+    model_version = os.path.basename(model_path).replace('.pkl', '')
+    
+    # ── Calculate SpO2 coverage percentage ──────────────────────────────────
+    spo2_coverage_pct = round(100.0 * n_spo2 / max(n, 1), 1)
+
     return {
         "admission_id":     adm_id,
         "fs_source_hz":     hz,
@@ -859,6 +975,9 @@ def _run_one_admission(
         "threshold":        threshold,
         "mean_hr_diff_bpm": round(float(hr_diffs.mean()), 2) if len(hr_diffs) else 0.0,
         "max_hr_diff_bpm":  round(float(hr_diffs.max()),  2) if len(hr_diffs) else 0.0,
+        "model_version": model_version,
+        "inference_time_ms": inference_time_ms,
+        "spo2_coverage_pct": spo2_coverage_pct,
     }
 
 
@@ -875,6 +994,7 @@ def run_inference(
     admission_id: Optional[str],
     force_hz:     Optional[int] = None,
     chunk_rows:   int = 500,
+    feature_mode: Optional[str] = None,
 ) -> None:
 
     os.makedirs(out_dir, exist_ok=True)
@@ -895,6 +1015,13 @@ def run_inference(
         if not os.path.exists(path):
             logger.error("%s not found: '%s' — run pipeline.py --save-model", label, path)
             return
+
+    # ── Feature representation: explicit --feature-mode wins, otherwise
+    # auto-detect from the model's companion metadata file ────────────────────
+    resolved_feature_mode = feature_mode or _load_model_feature_mode(model_path)
+    if feature_mode is not None:
+        logger.info("[MODEL] feature_mode explicitly overridden via --feature-mode='%s'",
+                    feature_mode)
 
     # ── MODEL LOADING (XGBoost .pkl) ─────────────────────────────────────────
     logger.info("Loading model from %s", model_path)
@@ -969,7 +1096,10 @@ def run_inference(
         logger.info("=" * 55)
 
         summary = _run_one_admission(
-            adm_id, adm_df, model, scaler, threshold, out_dir, hz)
+            adm_id, adm_df, model, scaler, threshold, out_dir, hz,
+            model_path=model_path,
+            feature_mode=resolved_feature_mode,
+        )
         if summary:
             all_summaries.append(summary)
 
@@ -983,6 +1113,7 @@ def run_inference(
             f"  Source     : {csv_path}",
             f"  Model      : {model_path}",
             f"  Model type : {model_type}",
+            f"  Feature mode : {resolved_feature_mode}",
             f"  Threshold  : {threshold}",
             f"  HR gate    : ±{HR_TOLERANCE} bpm",
             f"  ECG input  : {hz} Hz  ({ds_note})",
@@ -1001,6 +1132,9 @@ def run_inference(
                 f"  AHI proxy         : {s['ahi_proxy']} /hr  → {s['severity']}",
                 f"  Mean HR diff      : {s['mean_hr_diff_bpm']} bpm",
                 f"  Max HR diff       : {s['max_hr_diff_bpm']} bpm",
+                f"  Model version     : {s.get('model_version', 'unknown')}",
+                f"  Inference time    : {s.get('inference_time_ms', 0)} ms",
+                f"  SpO2 coverage     : {s.get('spo2_coverage_pct', 0)}%",
                 "",
             ]
         lines += [
@@ -1033,6 +1167,7 @@ Examples
   python infer.py --csv /path/to/file.csv --force-hz 250
   python infer.py --csv /path/to/file.csv --admission ADM914251465
   python infer.py --csv /path/to/file.csv --threshold 0.40 --out-dir results/
+  python infer.py --csv /path/to/file.csv --feature-mode aggregate
         """,
     )
     p.add_argument("--csv",       required=True)
@@ -1042,6 +1177,12 @@ Examples
     p.add_argument("--out-dir",   default="infer_output")
     p.add_argument("--admission", default=None)
     p.add_argument("--force-hz",  type=int, choices=[125, 250], default=None)
+    p.add_argument("--feature-mode", choices=["flatten", "aggregate", "both"], default=None,
+                    help="Override auto-detected feature representation. Normally "
+                         "left unset — infer.py reads this automatically from "
+                         "<model_stem>_meta.json next to --model (written by "
+                         "train_improved.py). Only set this if that file is "
+                         "missing/wrong for some reason.")
     return p.parse_args()
 
 
@@ -1055,6 +1196,7 @@ def main() -> None:
         out_dir      = args.out_dir,
         admission_id = args.admission,
         force_hz     = args.force_hz,
+        feature_mode = args.feature_mode,
     )
 
 
